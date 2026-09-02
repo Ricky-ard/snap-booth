@@ -157,7 +157,7 @@ def _rounded_mask(size, radius: int) -> Image.Image:
 
 
 def _fetch_image(src: str) -> Image.Image | None:
-    """Load an image from a local path or data URL (used for overlays)."""
+    """Load an image from a local path, storage-relative path, or data URL."""
     if not src:
         return None
     try:
@@ -166,7 +166,14 @@ def _fetch_image(src: str) -> Image.Image | None:
             b64 = src.split(",", 1)[1]
             return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
         from pathlib import Path
+        import os as _os
         p = Path(src)
+        if not p.is_absolute():
+            # Try storage-relative
+            root = Path(_os.environ.get("SNAPBOOTH_STORAGE", "/app/storage"))
+            candidate = root / src
+            if candidate.exists():
+                p = candidate
         if p.exists():
             return Image.open(p).convert("RGBA")
     except Exception:

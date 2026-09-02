@@ -2,7 +2,7 @@
 
 Serves the kiosk, admin dashboard, guest gallery. All routes under /api.
 """
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Response, Request
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Response, Request, UploadFile, File
 from fastapi.responses import FileResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
@@ -255,6 +255,48 @@ async def update_template(tid: str, payload: dict, _: dict = Depends(require_adm
 async def delete_template(tid: str, _: dict = Depends(require_admin)):
     await db.templates.delete_one({"_id": tid})
     return {"ok": True}
+
+
+# ---------- Template asset uploads (overlay / background PNGs) ----------
+_ALLOWED_UPLOAD_MIME = {"image/png", "image/jpeg", "image/webp"}
+
+async def _save_upload(kind: str, file: UploadFile) -> str:
+    """Persist a PNG/JPEG/WEBP upload under /storage/assets/{kind}/ and
+    return the RELATIVE path (usable via /api/files/{path}).
+    """
+    if file.content_type not in _ALLOWED_UPLOAD_MIME:
+        raise HTTPException(400, f"unsupported type {file.content_type}")
+    raw = await file.read()
+    if len(raw) > 12 * 1024 * 1024:
+        raise HTTPException(413, "file > 12MB")
+    # Re-encode through Pillow to strip anything malicious & normalize
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        raise HTTPException(400, "not a valid image")
+    ext = "png" if img.format == "PNG" or file.content_type == "image/png" else "jpg"
+    folder = STORAGE / "assets" / kind
+    folder.mkdir(parents=True, exist_ok=True)
+    fname = f"{secrets.token_hex(8)}.{ext}"
+    fp = folder / fname
+    if ext == "png":
+        img.save(fp, "PNG")
+    else:
+        img.convert("RGB").save(fp, "JPEG", quality=92)
+    return f"assets/{kind}/{fname}"
+
+
+@api.post("/uploads/overlay")
+async def upload_overlay(file: UploadFile = File(...), _: dict = Depends(require_admin)):
+    rel = await _save_upload("overlays", file)
+    return {"path": rel, "url": f"/api/files/{rel}"}
+
+
+@api.post("/uploads/background")
+async def upload_background(file: UploadFile = File(...), _: dict = Depends(require_admin)):
+    rel = await _save_upload("backgrounds", file)
+    return {"path": rel, "url": f"/api/files/{rel}"}
 
 
 # ---------- Filter presets ----------
