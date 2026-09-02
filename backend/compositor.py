@@ -5,8 +5,10 @@ matches what the guest saw. Filter params live in a shared JSON schema.
 """
 from __future__ import annotations
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw, ImageFont
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 import numpy as np
+
+from lut import apply_lut_trilinear, parse_cube_file
 
 
 # ---- Paper sizes ----------------------------------------------------------
@@ -49,7 +51,9 @@ PRESETS: Dict[str, Dict[str, Any]] = {
 
 
 # ---- Filter application on a Pillow image ---------------------------------
-def apply_filter_pil(img: Image.Image, params: Dict[str, float]) -> Image.Image:
+def apply_filter_pil(img: Image.Image, params: Dict[str, float],
+                     lut: Optional[np.ndarray] = None,
+                     lut_domain: Optional[tuple] = None) -> Image.Image:
     p = {**_p(), **(params or {})}
     im = img.convert("RGB")
 
@@ -120,6 +124,14 @@ def apply_filter_pil(img: Image.Image, params: Dict[str, float]) -> Image.Image:
         a = np.asarray(im).astype(np.float32) * vg[..., None]
         im = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
 
+    # 3D LUT — applied AFTER the parametric adjustments so a LUT can act as a
+    # final color grade on top of exposure/contrast/etc. This matches the
+    # WebGL preview pipeline in /app/frontend/src/lib/webglLut.js.
+    if lut is not None:
+        dmin, dmax = (None, None) if not lut_domain else lut_domain
+        arr = apply_lut_trilinear(np.asarray(im), lut, dmin, dmax)
+        im = Image.fromarray(arr)
+
     return im
 
 
@@ -182,7 +194,9 @@ def _fetch_image(src: str) -> Image.Image | None:
 
 
 def compose_print(template: Dict[str, Any], photo_paths: List[str],
-                  preset: Dict[str, float], out_print: str, out_web: str) -> None:
+                  preset: Dict[str, float], out_print: str, out_web: str,
+                  lut: Optional[np.ndarray] = None,
+                  lut_domain: Optional[tuple] = None) -> None:
     """Compose the print-ready file at exact paper size / 300 DPI.
 
     template.canvas may not be provided; fall back to paper size in pixels.
@@ -219,7 +233,7 @@ def compose_print(template: Dict[str, Any], photo_paths: List[str],
             src = Image.open(photo_paths[photo_idx]).convert("RGB")
         except Exception:
             continue
-        src = apply_filter_pil(src, preset or {})
+        src = apply_filter_pil(src, preset or {}, lut=lut, lut_domain=lut_domain)
         sx, sy = int(slot["x"]), int(slot["y"])
         sw, sh = int(slot["width"]), int(slot["height"])
         fitted = _cover_fit(src, sw, sh)

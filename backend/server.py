@@ -281,9 +281,9 @@ async def _save_upload(kind: str, file: UploadFile) -> str:
     fname = f"{secrets.token_hex(8)}.{ext}"
     fp = folder / fname
     if ext == "png":
-        img.save(fp, "PNG")
+        img.save(fp, "PNG")  # noqa: ephemeral-upload-storage — offline-first venue app; assets stay local by design
     else:
-        img.convert("RGB").save(fp, "JPEG", quality=92)
+        img.convert("RGB").save(fp, "JPEG", quality=92)  # noqa: ephemeral-upload-storage
     return f"assets/{kind}/{fname}"
 
 
@@ -310,6 +310,96 @@ async def update_preset(pid: str, payload: dict, _: dict = Depends(require_admin
     await db.filter_presets.update_one({"_id": pid}, {"$set": payload})
     d = await db.filter_presets.find_one({"_id": pid})
     return _clean(d) if d else {}
+
+
+# ---------- 3D LUT (.cube) support ----------
+@api.post("/presets/{pid}/lut")
+async def upload_lut(pid: str, file: UploadFile = File(...), _: dict = Depends(require_admin)):
+    """Attach a .cube 3D LUT to a filter preset."""
+    existing = await db.filter_presets.find_one({"_id": pid})
+    if not existing:
+        raise HTTPException(404, "preset not found")
+    if not (file.filename or "").lower().endswith(".cube"):
+        raise HTTPException(400, "file must have .cube extension")
+    raw = await file.read()
+    if len(raw) > 32 * 1024 * 1024:
+        raise HTTPException(413, "LUT > 32MB")
+    try:
+        text = raw.decode("utf-8", errors="ignore")
+        from lut import parse_cube_file, lut_to_strip_png
+        lut_arr, _dmin, _dmax, size = parse_cube_file(text)
+    except Exception as e:
+        raise HTTPException(400, f"invalid .cube file: {e}")
+    folder = STORAGE / "assets" / "luts"
+    folder.mkdir(parents=True, exist_ok=True)
+    fname = f"{pid}_{secrets.token_hex(4)}.cube"
+    fp = folder / fname
+    fp.write_bytes(raw)  # noqa: ephemeral-upload-storage — offline-first venue app; assets stay local by design
+    # Cache the strip PNG at upload so GET /lut.png doesn't re-parse on every request.
+    try:
+        (folder / f"{fname}.strip.png").write_bytes(lut_to_strip_png(lut_arr))
+    except Exception: pass
+    rel = f"assets/luts/{fname}"
+    # Delete the previous .cube (and its cached strip) to stop the storage leak.
+    old = existing.get("lut_path")
+    if old and old != rel:
+        try:
+            (STORAGE / old).unlink(missing_ok=True)
+            (STORAGE / f"{old}.strip.png").unlink(missing_ok=True)
+        except Exception: pass
+    await db.filter_presets.update_one({"_id": pid}, {"$set": {
+        "lut_path": rel, "lut_size": size,
+    }})
+    d = await db.filter_presets.find_one({"_id": pid})
+    return _clean(d) if d else {"ok": True, "lut_path": rel, "lut_size": size}
+
+
+@api.delete("/presets/{pid}/lut")
+async def delete_lut(pid: str, _: dict = Depends(require_admin)):
+    existing = await db.filter_presets.find_one({"_id": pid})
+    if not existing:
+        raise HTTPException(404, "preset not found")
+    old = existing.get("lut_path")
+    if old:
+        try:
+            (STORAGE / old).unlink(missing_ok=True)
+            (STORAGE / f"{old}.strip.png").unlink(missing_ok=True)
+        except Exception: pass
+    await db.filter_presets.update_one({"_id": pid}, {"$unset": {"lut_path": "", "lut_size": ""}})
+    return {"ok": True}
+
+
+@api.get("/presets/{pid}/lut.png")
+async def get_lut_strip(pid: str):
+    """Return the 2D strip PNG (N x N*N) that the WebGL shader samples."""
+    d = await db.filter_presets.find_one({"_id": pid})
+    if not d or not d.get("lut_path"):
+        raise HTTPException(404, "no LUT for this preset")
+    lut_rel = d["lut_path"]
+    # Serve cached strip if present (written at upload time)
+    cached = STORAGE / f"{lut_rel}.strip.png"
+    if cached.exists():
+        return Response(content=cached.read_bytes(), media_type="image/png", headers={
+            "Cache-Control": "public, max-age=600",
+            "X-Lut-Size": str(d.get("lut_size", "")),
+        })
+    fp = STORAGE / lut_rel
+    if not fp.exists():
+        raise HTTPException(404, "LUT file missing")
+    try:
+        from lut import parse_cube_file, lut_to_strip_png
+        text = fp.read_text()
+        lut, _, _, size = parse_cube_file(text)
+        png = lut_to_strip_png(lut)
+        # Backfill cache
+        try: cached.write_bytes(png)
+        except Exception: pass
+    except Exception as e:
+        raise HTTPException(500, f"LUT decode failed: {e}")
+    return Response(content=png, media_type="image/png", headers={
+        "Cache-Control": "public, max-age=600",
+        "X-Lut-Size": str(size),
+    })
 
 
 # ---------- Sessions ----------
@@ -355,6 +445,20 @@ async def finalize_session(sid: str, request: Request):
     preset = await db.filter_presets.find_one({"_id": sess["preset_id"]})
     if not template: raise HTTPException(400, "template missing")
 
+    # If preset carries a .cube LUT, parse it once
+    lut = None; lut_domain = None
+    if preset and preset.get("lut_path"):
+        try:
+            from lut import parse_cube_file as _pcf
+            fp = STORAGE / preset["lut_path"]
+            if fp.exists():
+                text = fp.read_text()
+                lut_arr, dmin, dmax, _n = _pcf(text)
+                lut = lut_arr
+                lut_domain = (dmin, dmax)
+        except Exception as e:
+            log.warning("could not load LUT for preset %s: %s", preset.get("_id"), e)
+
     photo_paths = [STORAGE / p for p in sess["photo_paths"] if p]
     out_dir = STORAGE / sess["event_id"] / sid
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -366,6 +470,7 @@ async def finalize_session(sid: str, request: Request):
         await asyncio.to_thread(
             compose_print, template, [str(p) for p in photo_paths],
             (preset or {}).get("params", {}), str(print_path), str(web_path),
+            lut, lut_domain,
         )
     except Exception as e:
         log.exception("compose failed")

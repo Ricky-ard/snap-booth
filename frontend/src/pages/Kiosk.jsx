@@ -6,6 +6,7 @@ import { api, fileUrl } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
 import { paramsToCss } from "@/lib/filters";
 import { beep, shutter, chime } from "@/lib/audio";
+import { attachLutRenderer, loadStripImage } from "@/lib/webglLut";
 import { Button } from "@/components/ui/button";
 
 const STEPS = ["idle", "template", "filter", "countdown", "review", "processing", "delivery"];
@@ -29,6 +30,8 @@ export default function Kiosk() {
   const [triple, setTriple] = useState([]);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
+  const lutCanvasRef = useRef(null);
+  const lutControllerRef = useRef(null);
   const idleTimer = useRef(null);
 
   // Load active event bundle
@@ -52,6 +55,29 @@ export default function Kiosk() {
       streamRef.current = null;
     }
   }, [step, t]);
+
+  // Attach WebGL LUT renderer when the picked preset has a .cube attached.
+  useEffect(() => {
+    // Tear down previous renderer whenever preset changes
+    if (lutControllerRef.current) {
+      lutControllerRef.current.stop();
+      lutControllerRef.current = null;
+    }
+    if (!preset?.lut_path || !videoRef.current || !lutCanvasRef.current) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const img = await loadStripImage(`${process.env.REACT_APP_BACKEND_URL}/api/presets/${preset.id}/lut.png`);
+        if (cancelled) return;
+        const size = preset.lut_size || 17;
+        const ctl = attachLutRenderer(lutCanvasRef.current, videoRef.current, img, size);
+        if (ctl) { ctl.setMirror(true); lutControllerRef.current = ctl; }
+      } catch (e) {
+        console.warn("LUT attach failed", e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [preset]);
 
   // Reset idle timer on any interaction
   const resetIdle = useCallback(() => {
@@ -264,7 +290,12 @@ export default function Kiosk() {
             className="w-full h-screen relative">
             <video ref={videoRef} data-testid="kiosk-camera-live-feed"
               autoPlay playsInline muted
-              className="w-full h-full object-cover" style={{transform:"scaleX(-1)", filter: cssFilter}} />
+              className="w-full h-full object-cover"
+              style={{transform:"scaleX(-1)", filter: cssFilter, visibility: preset?.lut_path ? "hidden" : "visible"}} />
+            {preset?.lut_path && (
+              <canvas ref={lutCanvasRef} data-testid="kiosk-lut-canvas"
+                className="absolute inset-0 w-full h-full object-cover pointer-events-none" />
+            )}
             <div className="absolute top-8 left-0 right-0 text-center">
               <h2 className="text-3xl font-bold">{t("choose_filter")}</h2>
             </div>
@@ -296,7 +327,12 @@ export default function Kiosk() {
           <motion.div key="countdown" initial={{opacity:0}} animate={{opacity:1}}
             className="w-full h-screen relative">
             <video ref={videoRef} autoPlay playsInline muted
-              className="w-full h-full object-cover" style={{transform:"scaleX(-1)", filter: cssFilter}} />
+              className="w-full h-full object-cover"
+              style={{transform:"scaleX(-1)", filter: cssFilter, visibility: preset?.lut_path ? "hidden" : "visible"}} />
+            {preset?.lut_path && (
+              <canvas ref={lutCanvasRef} data-testid="kiosk-lut-canvas-countdown"
+                className="absolute inset-0 w-full h-full object-cover pointer-events-none" />
+            )}
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
               <AnimatePresence mode="wait">
                 <motion.div key={count} initial={{scale:0.3, opacity:0}} animate={{scale:1, opacity:1}} exit={{scale:1.5, opacity:0}}

@@ -1,0 +1,50 @@
+{
+  "summary": "Validated the new .cube 3D LUT feature end-to-end. Installed missing scipy (was NOT installed, so the scipy parity test was silently skipping). Full backend suite now 65/65 passing: 48 pre-existing + 5 test_lut_parity.py (all 5 now execute, including the scipy reference comparison) + 12 new API-level tests in tests/test_lut_api.py (upload auth/validation, strip PNG serve + layout round-trip, delete, and two full end-to-end finalize runs comparing LUT vs no-LUT prints). Frontend: Admin Filters LUT upload/badge/remove flow verified in browser; Kiosk WebGL LUT canvas verified present with zero shader compile/link errors and correct strip PNG fetch (X-Lut-Size: 17). All LUTs removed from seeded presets and orphan .cube files cleaned up after testing.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/presets/{pid}/lut", "issue": "Unknown preset id (e.g. 'nope-xyz') returns 200 and writes an orphan .cube to /app/storage/assets/luts even though update_one matched no document. Should 404 when the preset does not exist."},
+      {"endpoint": "DELETE /api/presets/{pid}/lut", "issue": "Returns 200 for a preset that has no LUT / does not exist (no matched_count check). Idempotent but hides mistakes; 404 would be more correct."},
+      {"endpoint": "POST/DELETE /api/presets/{pid}/lut", "issue": "Disk leak: replacing or deleting a LUT never unlinks the previous .cube file. 30 files / 3.9MB accumulated during this test run (I cleaned them up). Delete the old file on replace/remove."},
+      {"endpoint": "GET /api/presets/{pid}/lut.png", "issue": "Origin correctly sends 'Cache-Control: public, max-age=600' (verified at 127.0.0.1:8001) but the preview edge proxy rewrites it to 'no-store, no-cache, must-revalidate'. Environment-level, no app change needed — the kiosk will just re-fetch the strip. Also HEAD returns 405 (GET only), as documented."},
+      {"endpoint": "GET /api/presets/{pid}/lut.png", "issue": "Strip PNG is re-parsed and re-encoded from the .cube text on every request (17^3 parse in the event loop, not offloaded to a thread). Fine for 17-size LUTs but a 64-size cube would block the loop for seconds — consider caching the encoded PNG on upload."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Kiosk countdown step LUT canvas", "issue": "The second LUT <canvas> rendered during the countdown/capture step has no data-testid (only the filter-step one does), so the capture-time preview cannot be asserted in automation.", "selector": "Kiosk.jsx line ~333", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Kiosk filter step", "issues": ["Filter thumbnails only apply the CSS param filter; a preset carrying a .cube LUT looks identical to its no-LUT version in the thumbnail strip (only the big preview is LUT-corrected). Consider a small LUT marker on the thumbnail for operator clarity. Not a spec requirement."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_lut_api.py",
+    "/app/backend/tests/test_lut_parity.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Return 404 from POST/DELETE /api/presets/{pid}/lut when the preset id does not exist (check matched_count) and skip writing the file.",
+    "Unlink the previous .cube file when a LUT is replaced or deleted to stop the storage leak.",
+    "Optional: cache the strip PNG at upload time instead of re-parsing the .cube on every GET /lut.png.",
+    "Optional: add data-testid to the countdown-step LUT canvas in Kiosk.jsx.",
+    "Add scipy to /app/backend/requirements.txt (I pip-installed 1.17.1 in this container) or the parity test silently skips in a fresh env."
+  ],
+  "critical_code_review_comments": [
+    "lut.py apply_lut_trilinear: the shape validation branch (lines 95-99) is dead logic — the first condition is written with mixed chained comparisons and effectively always passes, so a malformed LUT would raise deep inside the indexing instead of raising the intended ValueError. Simplify to `if lut.ndim != 4 or lut.shape[3] != 3 or not (lut.shape[0]==lut.shape[1]==lut.shape[2]): raise ValueError(...)`.",
+    "server.py upload_lut writes the file to disk BEFORE verifying the preset exists, guaranteeing an orphan on a bad pid; also the previous lut file is never removed.",
+    "parse_cube_file silently ignores unparseable non-keyword lines (`continue`), so a file with the right entry count but garbage interleaved could parse; acceptable but the entry-count check is the only real guard.",
+    "finalize_session inlines the LUT load; it is correctly wrapped in try/except and compose_print runs via asyncio.to_thread (good — 1200x1800 trilinear does not block the loop)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_lut_api.py (new, 12 API tests)"
+  ],
+  "success_rate": {"backend": "100% (65/65 pytest)", "frontend": "100% of LUT flows tested (admin upload/badge/remove, kiosk WebGL canvas)"},
+  "seed_data_creation": "Temporarily attached identity + teal/orange .cube LUTs to preset 'warm' and ran 5 finalize sessions on the active demo event. All LUTs detached afterwards (verified: no seeded preset has lut_path) and the 30 leaked .cube files in /app/storage/assets/luts were deleted.",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "Admin password snapbooth, kiosk PIN 1234 (from /app/memory/test_credentials.md) — both valid.",
+  "context_for_next_testing_agent": "Backend suite is 65 tests: backend_test.py (48), test_lut_parity.py (5, needs scipy installed), test_lut_api.py (12, new). pytest.ini forces -n 2 --dist loadscope, so all LUT API tests must stay in the single class TestLutFeature to avoid cross-worker races on the shared 'warm' preset. active_event fixture returns a bundle — event id is at active_event['event']['id']. GET /api/presets/{pid}/lut.png returns 405 for HEAD; edge proxy strips the public Cache-Control. Kiosk filter step is reachable headless without a camera (getUserMedia failure only toasts), so kiosk-lut-canvas + WebGL shader compile can be asserted; real image parity is proven by the numpy shader simulation in test_lut_parity.py.",
+  "rca_of_the_issue": "No functional defect found in the LUT feature. Two housekeeping bugs: (1) upload/delete LUT endpoints do not verify the preset exists before mutating storage (update_one matched_count ignored), producing orphan files and misleading 200s; (2) old .cube files are never unlinked on replace/delete, leaking disk (3.9MB after 30 uploads). The reported 'scipy installed' precondition was false — scipy was missing, so test_trilinear_matches_scipy_reference was skipping; after `pip install scipy` it passes (mean drift < 0.6, max <= 2 counts)."
+}
