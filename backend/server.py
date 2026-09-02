@@ -19,6 +19,7 @@ import qrcode
 from PIL import Image
 
 from compositor import compose_print, PRESETS
+from cloud_sync import start_sync_worker, get_worker, internet_reachable
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -137,6 +138,9 @@ async def startup():
             "active": True, "created_at": now_iso(),
             "template_ids": tids, "preset_ids": pids})
         log.info(f"Seeded demo event {eid}")
+
+    # Kick off the cloud sync worker (offline-safe — no-ops when unreachable).
+    start_sync_worker(db)
 
 
 # ---------- Auth ----------
@@ -635,6 +639,39 @@ async def _run_print_job(jid: str):
 @api.get("/print/queue")
 async def print_queue(_: dict = Depends(require_admin)):
     return [_clean(j) async for j in db.print_jobs.find({}).sort("created_at", -1).limit(200)]
+
+
+# ---------- Cloud sync ----------
+@api.get("/sync/status")
+async def sync_status():
+    w = get_worker()
+    pending = await db.sessions.count_documents({
+        "status": "ready", "synced_to_cloud": {"$ne": True},
+    })
+    synced = await db.sessions.count_documents({"synced_to_cloud": True})
+    return {
+        "online": internet_reachable(),
+        "driver": (w.driver.name if w else None),
+        "running": bool(w and w.running()),
+        "stats": (w.stats if w else {}),
+        "pending": pending, "synced": synced,
+    }
+
+@api.post("/sync/trigger")
+async def sync_trigger():
+    w = get_worker()
+    if not w:
+        raise HTTPException(503, "sync worker not running")
+    w.trigger()
+    return {"ok": True}
+
+@api.post("/sync/{sid}/retry")
+async def sync_retry(sid: str, _: dict = Depends(require_admin)):
+    await db.sessions.update_one({"_id": sid}, {"$set": {"synced_to_cloud": False},
+                                                "$unset": {"last_sync_error": ""}})
+    w = get_worker()
+    if w: w.trigger()
+    return {"ok": True}
 
 
 # ---------- Hardware ----------

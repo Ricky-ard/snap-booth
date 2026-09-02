@@ -7,12 +7,14 @@ import { useLang } from "@/lib/i18n";
 import { paramsToCss } from "@/lib/filters";
 import { beep, shutter, chime } from "@/lib/audio";
 import { attachLutRenderer, loadStripImage } from "@/lib/webglLut";
+import { useConnectivity } from "@/lib/connectivity";
 import { Button } from "@/components/ui/button";
 
 const STEPS = ["idle", "template", "filter", "countdown", "review", "processing", "delivery"];
 
 export default function Kiosk() {
   const { t, lang, setLang } = useLang();
+  const { online, lan } = useConnectivity();
   const [bundle, setBundle] = useState(null);
   const [step, setStep] = useState("idle");
   const [template, setTemplate] = useState(null);
@@ -272,6 +274,20 @@ export default function Kiosk() {
         className="fixed top-4 right-24 z-40 h-16 px-5 rounded-full bg-white/10 backdrop-blur border border-white/20 font-mono text-sm uppercase tracking-wider">
         {lang.toUpperCase()} · {lang === "en" ? "ID" : "EN"}
       </button>
+
+      {/* Connectivity chip — kiosk keeps working offline; this reassures the operator */}
+      {!online && lan && (
+        <div data-testid="kiosk-offline-chip"
+          className="fixed bottom-4 left-4 z-40 px-3 py-1.5 rounded-full bg-amber-500/25 border border-amber-400/60 text-amber-100 text-xs font-mono uppercase tracking-widest backdrop-blur">
+          Offline · prints & QR still work
+        </div>
+      )}
+      {!lan && (
+        <div data-testid="kiosk-lan-lost-chip"
+          className="fixed bottom-4 left-4 z-40 px-3 py-1.5 rounded-full bg-rose-500/30 border border-rose-400/60 text-rose-100 text-xs font-mono uppercase tracking-widest backdrop-blur">
+          Backend unreachable — check the booth machine
+        </div>
+      )}
 
       {/* Flash overlay */}
       {flash && <div className="animate-flash fixed inset-0 bg-white z-[100] pointer-events-none" />}

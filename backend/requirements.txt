@@ -131,3 +131,4 @@ yarl==1.24.5
 zipp==4.1.0
 imageio-ffmpeg==0.6.0
 ImageIO==2.37.4
+pytest-asyncio==1.4.0

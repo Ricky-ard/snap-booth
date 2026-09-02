@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
 import { api, fileUrl } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { Trash2, Printer, ExternalLink, Download } from "lucide-react";
+import { Trash2, Printer, ExternalLink, Download, Cloud, CloudOff, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
 export default function AdminGallery() {
   const [sessions, setSessions] = useState([]);
   const [sel, setSel] = useState(null);
   const load = () => api.get("/sessions").then(r => setSessions(r.data));
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); const iv = setInterval(load, 8000); return () => clearInterval(iv); }, []);
 
   async function reprint(s) {
     await api.post(`/print/${s.id}?copies=1`); toast.success("Sent to print queue");
@@ -16,6 +16,11 @@ export default function AdminGallery() {
   async function del(id) {
     if (!window.confirm("Delete session?")) return;
     await api.delete(`/sessions/${id}`); setSel(null); load();
+  }
+  async function retrySync(id) {
+    await api.post(`/sync/${id}/retry`);
+    toast.success("Queued for cloud sync");
+    load();
   }
 
   return (
@@ -33,12 +38,19 @@ export default function AdminGallery() {
         {sessions.map(s => (
           <button key={s.id} onClick={() => setSel(s)}
             data-testid="admin-gallery-session-card"
-            className="rounded-xl overflow-hidden border border-slate-800 hover:border-rose-500 bg-[#161B22]">
+            className="rounded-xl overflow-hidden border border-slate-800 hover:border-rose-500 bg-[#161B22] relative">
             {s.web_path ? (
               <img src={fileUrl(s.web_path)} alt="" className="w-full aspect-[3/4] object-cover" />
             ) : (
               <div className="w-full aspect-[3/4] bg-slate-800 flex items-center justify-center text-slate-500 text-sm">In progress</div>
             )}
+            <span data-testid="admin-gallery-sync-badge"
+              className={`absolute top-2 right-2 px-1.5 py-0.5 rounded-full text-[9px] font-mono uppercase tracking-widest flex items-center gap-1 ${
+                s.synced_to_cloud ? "bg-emerald-500/85 text-white" : "bg-amber-500/85 text-black"
+              }`} title={s.cloud_url || s.last_sync_error || "queued for upload"}>
+              {s.synced_to_cloud ? <Cloud className="w-2.5 h-2.5" /> : <CloudOff className="w-2.5 h-2.5" />}
+              {s.synced_to_cloud ? "synced" : "pending"}
+            </span>
             <div className="p-2 text-xs">
               <div className="font-mono text-slate-400">{new Date(s.started_at).toLocaleString()}</div>
               <div className="text-slate-300">{s.copies_printed} print{s.copies_printed !== 1 ? "s" : ""}</div>
@@ -57,6 +69,11 @@ export default function AdminGallery() {
               </div>
               <div className="flex gap-2">
                 <Button size="sm" onClick={() => reprint(sel)} className="bg-sky-500 hover:bg-sky-600"><Printer className="w-4 h-4 mr-1"/>Re-print</Button>
+                {!sel.synced_to_cloud && (
+                  <Button size="sm" data-testid="admin-gallery-retry-sync-btn" onClick={() => retrySync(sel.id)} className="bg-amber-500 hover:bg-amber-600 text-black">
+                    <RefreshCw className="w-4 h-4 mr-1"/>Retry sync
+                  </Button>
+                )}
                 <Button size="sm" variant="outline" className="border-slate-700" asChild><a href={`/g/${sel.qr_token}`} target="_blank" rel="noreferrer"><ExternalLink className="w-4 h-4 mr-1"/>Open QR</a></Button>
                 <a className="text-xs" href={`${process.env.REACT_APP_BACKEND_URL}/api/g/${sel.qr_token}/zip`}><Button size="sm" variant="outline" className="border-slate-700"><Download className="w-4 h-4 mr-1"/>ZIP</Button></a>
                 <Button size="sm" variant="outline" className="border-rose-500/50 text-rose-300" onClick={() => del(sel.id)}><Trash2 className="w-4 h-4"/></Button>
