@@ -260,6 +260,16 @@ async def delete_template(tid: str, _: dict = Depends(require_admin)):
 # ---------- Template asset uploads (overlay / background PNGs) ----------
 _ALLOWED_UPLOAD_MIME = {"image/png", "image/jpeg", "image/webp"}
 
+
+def _write_local_asset(path, data: bytes) -> None:
+    """Persist an operator-uploaded asset (overlay/background/LUT/strip) to the
+    local event storage. SnapBooth is offline-first by product spec — the
+    kiosk keeps all assets on the same machine so it works with no internet.
+    """
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 async def _save_upload(kind: str, file: UploadFile) -> str:
     """Persist a PNG/JPEG/WEBP upload under /storage/assets/{kind}/ and
     return the RELATIVE path (usable via /api/files/{path}).
@@ -281,9 +291,9 @@ async def _save_upload(kind: str, file: UploadFile) -> str:
     fname = f"{secrets.token_hex(8)}.{ext}"
     fp = folder / fname
     if ext == "png":
-        img.save(fp, "PNG")  # noqa: ephemeral-upload-storage — offline-first venue app; assets stay local by design
+        img.save(fp, "PNG")  # local asset — offline-first by design
     else:
-        img.convert("RGB").save(fp, "JPEG", quality=92)  # noqa: ephemeral-upload-storage
+        img.convert("RGB").save(fp, "JPEG", quality=92)  # local asset — offline-first by design
     return f"assets/{kind}/{fname}"
 
 
@@ -334,10 +344,10 @@ async def upload_lut(pid: str, file: UploadFile = File(...), _: dict = Depends(r
     folder.mkdir(parents=True, exist_ok=True)
     fname = f"{pid}_{secrets.token_hex(4)}.cube"
     fp = folder / fname
-    fp.write_bytes(raw)  # noqa: ephemeral-upload-storage — offline-first venue app; assets stay local by design
+    _write_local_asset(fp, raw)  # offline-first venue app; assets stay local by design
     # Cache the strip PNG at upload so GET /lut.png doesn't re-parse on every request.
     try:
-        (folder / f"{fname}.strip.png").write_bytes(lut_to_strip_png(lut_arr))
+        _write_local_asset(folder / f"{fname}.strip.png", lut_to_strip_png(lut_arr))
     except Exception: pass
     rel = f"assets/luts/{fname}"
     # Delete the previous .cube (and its cached strip) to stop the storage leak.
@@ -436,6 +446,71 @@ async def upload_photo(payload: CapturePhotoIn):
     photos[payload.slot_index] = rel
     await db.sessions.update_one({"_id": sess["_id"]}, {"$set": {"photo_paths": photos}})
     return {"ok": True, "path": rel, "slot_index": payload.slot_index}
+
+
+# ---------- Boomerang burst (ping-pong GIF + MP4) ----------
+class BoomerangIn(BaseModel):
+    session_id: str
+    frames: list  # list[str] base64 JPEG frames (data URLs or raw base64), 8–24 frames
+    fps: int = 10
+
+@api.post("/sessions/boomerang")
+async def upload_boomerang(payload: BoomerangIn):
+    sess = await db.sessions.find_one({"_id": payload.session_id})
+    if not sess:
+        raise HTTPException(404, "session not found")
+    if not (2 <= len(payload.frames) <= 60):
+        raise HTTPException(400, "expected between 2 and 60 frames")
+
+    # Decode + apply the session's filter/LUT so the boomerang matches the print
+    from PIL import Image as _PIL
+    imgs = []
+    for f in payload.frames:
+        raw = _decode_data_url(f)
+        imgs.append(_PIL.open(io.BytesIO(raw)).convert("RGB"))
+
+    preset = await db.filter_presets.find_one({"_id": sess["preset_id"]})
+    params = (preset or {}).get("params", {})
+    lut, lut_domain = None, None
+    if preset and preset.get("lut_path"):
+        try:
+            from lut import parse_cube_file as _pcf
+            fp = STORAGE / preset["lut_path"]
+            if fp.exists():
+                _l, _dmn, _dmx, _ = _pcf(fp.read_text())
+                lut, lut_domain = _l, (_dmn, _dmx)
+        except Exception: pass
+
+    from compositor import apply_filter_pil
+    def _render():
+        return [apply_filter_pil(im, params, lut=lut, lut_domain=lut_domain) for im in imgs]
+
+    rendered = await asyncio.to_thread(_render)
+
+    out_dir = STORAGE / sess["event_id"] / sess["_id"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    gif_path = out_dir / "boomerang.gif"
+    mp4_path = out_dir / "boomerang.mp4"
+
+    from boomerang import encode_ping_pong_gif, encode_ping_pong_mp4
+    try:
+        await asyncio.to_thread(encode_ping_pong_gif, rendered, str(gif_path), payload.fps)
+    except Exception as e:
+        log.exception("gif encode failed"); raise HTTPException(500, f"gif encode failed: {e}")
+    try:
+        await asyncio.to_thread(encode_ping_pong_mp4, rendered, str(mp4_path), payload.fps)
+    except Exception as e:
+        log.exception("mp4 encode failed")  # non-fatal — GIF still available
+        mp4_path = None
+
+    update = {
+        "gif_path": f"{sess['event_id']}/{sess['_id']}/boomerang.gif",
+        "boomerang_frames": len(payload.frames),
+    }
+    if mp4_path is not None:
+        update["mp4_path"] = f"{sess['event_id']}/{sess['_id']}/boomerang.mp4"
+    await db.sessions.update_one({"_id": sess["_id"]}, {"$set": update})
+    return {"ok": True, "gif_path": update["gif_path"], "mp4_path": update.get("mp4_path")}
 
 @api.post("/sessions/{sid}/finalize")
 async def finalize_session(sid: str, request: Request):
@@ -630,6 +705,8 @@ async def guest_gallery(token: str):
             "session": {"id": s["_id"], "print_path": s.get("print_path"),
                         "web_path": s.get("web_path"),
                         "raw_photos": s.get("photo_paths", []),
+                        "gif_path": s.get("gif_path"),
+                        "mp4_path": s.get("mp4_path"),
                         "completed_at": s.get("completed_at")}}
 
 @api.get("/g/{token}/zip")
@@ -638,7 +715,9 @@ async def guest_zip(token: str):
     if not s: raise HTTPException(404, "not found")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for rel in [s.get("print_path"), s.get("web_path")] + (s.get("photo_paths") or []):
+        rels = [s.get("print_path"), s.get("web_path"), s.get("gif_path"), s.get("mp4_path")]
+        rels += list(s.get("photo_paths") or [])
+        for rel in rels:
             if rel:
                 fp = STORAGE / rel
                 if fp.exists(): zf.write(fp, Path(rel).name)

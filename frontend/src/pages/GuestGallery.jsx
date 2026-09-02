@@ -84,6 +84,32 @@ export default function GuestGallery() {
           <div className="rounded-2xl overflow-hidden border border-slate-800 bg-slate-900">
             <img src={fileUrl(s.print_path)} alt="Your print" className="w-full" />
           </div>
+          {(s.gif_path || s.mp4_path) && (
+            <div data-testid="guest-gallery-boomerang" className="rounded-2xl overflow-hidden border border-fuchsia-500/40 bg-slate-900 relative">
+              {s.mp4_path ? (
+                <video src={fileUrl(s.mp4_path)} autoPlay loop muted playsInline className="w-full" />
+              ) : (
+                <img src={fileUrl(s.gif_path)} alt="Boomerang" className="w-full" />
+              )}
+              <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider bg-fuchsia-500 text-white">
+                BOOMERANG · TAP TO SAVE
+              </span>
+              <div className="p-3 flex gap-2">
+                {s.gif_path && (
+                  <a href={fileUrl(s.gif_path)} download data-testid="guest-gallery-gif-download"
+                     className="flex-1 h-11 rounded-xl bg-slate-800 hover:bg-slate-700 text-sm font-medium flex items-center justify-center gap-2">
+                    <Download className="w-4 h-4" /> GIF
+                  </a>
+                )}
+                {s.mp4_path && (
+                  <a href={fileUrl(s.mp4_path)} download data-testid="guest-gallery-mp4-download"
+                     className="flex-1 h-11 rounded-xl bg-slate-800 hover:bg-slate-700 text-sm font-medium flex items-center justify-center gap-2">
+                    <Download className="w-4 h-4" /> MP4
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
           <Button onClick={downloadAll} data-testid="guest-gallery-download-all-button"
             className="w-full h-14 bg-rose-500 hover:bg-rose-600 text-white text-base font-bold">
             <Download className="w-5 h-5 mr-2" /> Download all as ZIP

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Camera, Sparkles, Volume2, VolumeX, RotateCcw, Check, Printer, Home, Loader2 } from "lucide-react";
+import { Camera, Sparkles, Volume2, VolumeX, RotateCcw, Check, Printer, Home, Loader2, Film } from "lucide-react";
 import { toast } from "sonner";
 import { api, fileUrl } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
@@ -28,6 +28,7 @@ export default function Kiosk() {
   const [pinOpen, setPinOpen] = useState(false);
   const [pin, setPin] = useState("");
   const [triple, setTriple] = useState([]);
+  const [boomerang, setBoomerang] = useState(null); // {gif_path, mp4_path} | "capturing"
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const lutCanvasRef = useRef(null);
@@ -96,6 +97,7 @@ export default function Kiosk() {
   function goIdle() {
     setStep("idle"); setTemplate(null); setPreset(null); setSession(null);
     setShotIndex(0); setPhotos([]); setFinalized(null); setCopies(1);
+    setBoomerang(null);
   }
 
   // Triple-tap hidden admin gesture
@@ -170,10 +172,49 @@ export default function Kiosk() {
       if (n + 1 < total) {
         setShotIndex(n + 1);
         runCountdown(n + 1);
+      } else if (template?.is_boomerang) {
+        captureBoomerang();
       } else {
         setStep("review");
       }
     }, 1500);
+  }
+
+  // Boomerang burst: 12 frames at 10fps -> POST to backend for GIF+MP4 encoding
+  async function captureBoomerang() {
+    setStep("boomerang");
+    setBoomerang("capturing");
+    beep(1200, 60, muted);
+    const v = videoRef.current;
+    if (!v) { setStep("review"); return; }
+    const frames = [];
+    const canvas = document.createElement("canvas");
+    canvas.width = v.videoWidth || 1280;
+    canvas.height = v.videoHeight || 720;
+    const ctx = canvas.getContext("2d");
+    for (let i = 0; i < 12; i++) {
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.translate(canvas.width, 0); ctx.scale(-1, 1);
+      ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+      frames.push(canvas.toDataURL("image/jpeg", 0.82));
+      // 100ms between frames = 10 fps burst
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    beep(400, 100, muted);
+    try {
+      const r = await api.post("/sessions/boomerang", {
+        session_id: session.id, frames, fps: 10,
+      });
+      setBoomerang(r.data);
+      chime(muted);
+    } catch (e) {
+      console.warn("boomerang encode failed", e);
+      toast.error("Boomerang failed — keeping your prints");
+      setBoomerang(null);
+    }
+    setStep("review");
   }
 
   async function retake(n) {
@@ -351,6 +392,23 @@ export default function Kiosk() {
           </motion.div>
         )}
 
+        {step === "boomerang" && (
+          <motion.div key="boom" initial={{opacity:0}} animate={{opacity:1}}
+            className="w-full h-screen relative">
+            <video ref={videoRef} autoPlay playsInline muted
+              className="w-full h-full object-cover" style={{transform:"scaleX(-1)", filter: cssFilter}} />
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40">
+              <Film className="w-24 h-24 text-fuchsia-400 mb-6 animate-pulse" />
+              <div data-testid="kiosk-boomerang-status" className="text-4xl font-black tracking-tight text-white">
+                {boomerang === "capturing" ? "HOLD IT — BOOMERANG!" : "Rendering your loop…"}
+              </div>
+              <div className="mt-4 text-sm font-mono uppercase tracking-widest text-slate-300">
+                12 frames · 10 fps · ping-pong
+              </div>
+            </div>
+          </motion.div>
+        )}
+
         {step === "review" && (
           <motion.div key="review" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
             className="w-full h-screen flex flex-col p-8">
@@ -365,6 +423,14 @@ export default function Kiosk() {
                   </button>
                 </div>
               ))}
+              {boomerang && boomerang !== "capturing" && boomerang.gif_path && (
+                <div data-testid="kiosk-boomerang-preview" className="relative rounded-2xl overflow-hidden border-2 border-fuchsia-500/60 bg-black">
+                  <img src={fileUrl(boomerang.gif_path)} alt="Boomerang" className="w-full h-full object-cover" />
+                  <span className="absolute top-2 left-2 px-2 py-0.5 rounded-full text-[10px] font-mono uppercase tracking-wider bg-fuchsia-500 text-white flex items-center gap-1">
+                    <Film className="w-3 h-3" /> BOOMERANG
+                  </span>
+                </div>
+              )}
             </div>
             <Button data-testid="kiosk-confirm-print-button" onClick={finalize}
               className="h-20 text-2xl font-black bg-emerald-500 hover:bg-emerald-600 shadow-[0_0_35px_rgba(16,185,129,0.5)]">

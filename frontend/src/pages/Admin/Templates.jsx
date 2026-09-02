@@ -228,6 +228,15 @@ export default function AdminTemplates() {
                       />
                       <span className="text-xs">Duplicate strip on 4x6 sheet</span>
                     </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        data-testid="admin-template-boomerang-toggle"
+                        checked={!!sel.is_boomerang}
+                        onChange={(e) => setSel({ ...sel, is_boomerang: e.target.checked })}
+                      />
+                      <span className="text-xs">Boomerang burst after prints</span>
+                    </label>
                   </div>
                 </div>
 

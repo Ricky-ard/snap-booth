@@ -86,5 +86,6 @@ DEFAULT_TEMPLATES = [
             {"text": "SNAPBOOTH", "x": 500, "y": 1360, "font_size": 60, "color": "#f43f5e"},
         ],
         "duplicate_on_sheet": False,
+        "is_boomerang": True,
     },
 ]
