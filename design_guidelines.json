@@ -1,0 +1,191 @@
+{
+  "project_name": "SnapBooth",
+  "archetype": "High-Energy Event Kiosk & Tactical Operator Dashboard",
+  "overview": "SnapBooth is an enterprise-grade photo booth application (LumaBooth-style) engineered for event professionals running weddings, birthday parties, and corporate activations. It encompasses three distinct visual surfaces: Surface A (Fullscreen Touch Kiosk), Surface B (Tactical Operator Admin Dashboard), and Surface C (Public Mobile Guest Gallery).",
+  "surfaces": {
+    "kiosk": {
+      "name": "Surface A: Guest-Facing Kiosk",
+      "target_display": "1080x1920 Portrait (primary booth mode) AND 1920x1080 Landscape responsive flex layout",
+      "ux_constraints": [
+        "Strictly zero browser chrome & zero viewport scrolling (overflow-hidden h-screen w-screen)",
+        "Minimum touch target size: 64px x 64px (padding p-4 to p-6 for all interactive touch targets)",
+        "Hidden exit gesture: Triple-tap top-left corner (invisible 80x80px area) triggers PIN pad modal",
+        "Auto-idle return: 60s inactivity timer auto-resets session to attract screen with soft toast warning at 10s",
+        "Mute toggle support: Respect per-event audio mute setting while triggering countdown beeps, shutter flash sound, and print completion chime",
+        "Dual-language toggle: Hot switchable English and Bahasa Indonesia (id) strings on header/attract overlay"
+      ],
+      "color_system": {
+        "bg_primary": "bg-[#0A0D14]",
+        "bg_surface": "bg-[#121824]/90",
+        "bg_glass": "backdrop-blur-xl bg-[#121824]/70 border border-white/10",
+        "accent_primary": "bg-gradient-to-r from-amber-400 via-rose-500 to-fuchsia-600",
+        "accent_pulse": "shadow-[0_0_35px_rgba(244,63,94,0.45)]",
+        "text_primary": "text-white",
+        "text_secondary": "text-slate-300",
+        "text_muted": "text-slate-400"
+      },
+      "screens": {
+        "idle_attract": "Fullscreen animated photo mosaic or looping hero backdrop + large pulsing pill 'TAP TO START' (min height 72px) + Event logo overlay + language switcher pill (EN | ID)",
+        "template_picker": "Responsive card grid (2x2 or 2x3) displaying high-res thumbnail previews of print layouts (e.g. 4x6 3-pose strip, 2x6 dual strip, 4-pose grid) with active highlight ring",
+        "filter_picker": "Live camera feed canvas backdrop + horizontal bottom swipeable filter carousel with real-time SVG filter preview thumbnails (Original, Vintage Warm, B&W Glam, Cyber Neon, Soft Pastel, Retro Film)",
+        "countdown_capture": "Fullscreen mirrored camera canvas + central giant numeric countdown (5..4..3..2..1 with spring scale-up animation) + bold 'GET READY!' prompt + high-intensity full screen white flash backdrop on shutter stroke",
+        "review_retake": "Side-by-side or stacked preview of captured shots with prominent touch action controls: 'RETAKE SHOT #' (warning orange accent) vs 'KEEP & PRINT' (emerald glow CTA)",
+        "processing": "Full-overlay ambient particle ring / processing spinner + progress bar ('Compositing your print template...', 'Applying filter...', 'Generating QR code...')",
+        "print_qr_delivery": "Split view screen: High-res rendered final print card on left/top + massive scannable QR Code (/g/{token}) with 'SCAN TO DOWNLOAD TO YOUR PHONE' on right/bottom + big 'PRINT AGAIN' & 'DONE' action buttons"
+      }
+    },
+    "admin": {
+      "name": "Surface B: Operator Admin Dashboard",
+      "target_display": "Desktop and tablet web browsers (password & JWT protected, 30-day session)",
+      "ux_constraints": [
+        "Tactical command-center high density layout with sticky sidebar and quick-action top bar",
+        "Live status indicators for Camera status (Webcam / Mock DSLR), Printer status (Ready / Printing / Out of paper / Offline), and Booth Bridge connection",
+        "Visual slot template editor with drag-and-resize photo frames over custom PNG overlay images",
+        "Direct Reprint / Re-send QR / Delete / ZIP Download gallery management",
+        "Kiosk Launcher direct shortcut button on navigation header"
+      ],
+      "color_system": {
+        "bg_primary": "bg-[#090C10]",
+        "bg_card": "bg-[#161B22]",
+        "border_subtle": "border-slate-800",
+        "accent_info": "bg-sky-500",
+        "accent_success": "bg-emerald-500",
+        "accent_warning": "bg-amber-500",
+        "accent_danger": "bg-rose-500",
+        "text_primary": "text-slate-100",
+        "text_secondary": "text-slate-400"
+      },
+      "modules": [
+        "Event Management (active event switch, event name, date, watermark logo, mute audio toggle)",
+        "Visual Template Editor (canvas grid overlay, add photo slot, coordinates x/y/w/h editor, overlay PNG upload)",
+        "Filter Preset Manager (enable/disable filters, preview parameters)",
+        "Hardware & Booth Bridge Diagnostics (Camera feed live test, DSLR stub toggle, Printer driver selection [Mock Driver vs Native System Printer], Paper count reset gauge, Bridge WebSocket ping indicator)",
+        "Live Stats Counter (Sessions Today, Prints Today, Paper Remaining %, Avg Session Duration)",
+        "Gallery & Session History (search by token/time, thumbnail grid, batch download ZIP)"
+      ]
+    },
+    "guest_gallery": {
+      "name": "Surface C: Public Mobile Guest Gallery (/g/{token})",
+      "target_display": "Mobile smartphones (iOS / Android Safari & Chrome)",
+      "ux_constraints": [
+        "No authentication required — completely public per token link",
+        "Ultra-fast loading with smooth image zoom modal and high contrast download buttons",
+        "Native Web Share API button + direct Download Single/All as ZIP buttons",
+        "Event branding header banner with host congratulations message"
+      ],
+      "color_system": {
+        "bg_primary": "bg-slate-950",
+        "bg_card": "bg-slate-900/90",
+        "border_subtle": "border-slate-800",
+        "accent_primary": "bg-rose-500 hover:bg-rose-600 text-white",
+        "text_primary": "text-white",
+        "text_secondary": "text-slate-300"
+      }
+    }
+  },
+  "typography": {
+    "font_family_headings": "Outfit, Plus Jakarta Sans, sans-serif",
+    "font_family_body": "Plus Jakarta Sans, system-ui, sans-serif",
+    "font_family_mono": "JetBrains Mono, monospace",
+    "scale": {
+      "kiosk_countdown": "text-8xl sm:text-9xl font-black tracking-tighter",
+      "h1_kiosk": "text-4xl sm:text-5xl font-extrabold tracking-tight",
+      "h2_kiosk": "text-2xl sm:text-3xl font-bold tracking-tight",
+      "h1_admin": "text-2xl sm:text-3xl font-bold tracking-tight",
+      "h2_admin": "text-xl sm:text-2xl font-semibold",
+      "body_kiosk": "text-lg sm:text-xl font-medium leading-relaxed",
+      "body_admin": "text-sm text-slate-300 leading-normal",
+      "badge_mono": "font-mono text-xs uppercase tracking-wider"
+    }
+  },
+  "visual_enhancers": {
+    "glassmorphism": "backdrop-blur-xl bg-slate-900/75 border border-white/10 shadow-2xl rounded-2xl",
+    "shutter_flash": "fixed inset-0 bg-white z-[100] animate-flash pointer-events-none",
+    "active_card_glow": "ring-2 ring-rose-500 shadow-[0_0_25px_rgba(244,63,94,0.4)] transition-all duration-300",
+    "kiosk_touch_feedback": "active:scale-95 hover:scale-[1.02] transition-transform duration-150 ease-out cursor-pointer select-none",
+    "status_dot_pulse": "relative flex h-3 w-3 children:[&_span]:animate-ping"
+  },
+  "audio_feedback": {
+    "enabled_by_default": true,
+    "sounds": {
+      "countdown_beep": "Audio synth beep (800Hz tone, 100ms)",
+      "shutter_click": "Realistic camera shutter audio sample / click wave",
+      "success_chime": "Upbeat chord chime on photo finish / print queue"
+    }
+  },
+  "hardware_stub_specs": {
+    "camera": "Webcam browser API (navigator.mediaDevices.getUserMedia) with fallback Mock DSLR Stub (simulates high-res 24MP frame grab + flash lag)",
+    "printer": "PrinterDriver interface abstraction supporting Mock Printer Driver (queues job with progress bar, logs to DB, decrements paper supply count) and System Print Stub"
+  },
+  "i18n": {
+    "languages": ["en", "id"],
+    "default": "en",
+    "sample_keys": {
+      "tap_to_start": {
+        "en": "TAP TO START",
+        "id": "SENTUH UNTUK MULAI"
+      },
+      "choose_template": {
+        "en": "Select Print Layout",
+        "id": "Pilih Tata Letak Cetak"
+      },
+      "choose_filter": {
+        "en": "Choose Photo Style",
+        "id": "Pilih Gaya Foto"
+      },
+      "get_ready": {
+        "en": "GET READY!",
+        "id": "BERSIAPLAH!"
+      },
+      "retake": {
+        "en": "Retake Photo",
+        "id": "Foto Ulang"
+      },
+      "print_and_download": {
+        "en": "Print & Scan QR",
+        "id": "Cetak & Pindai QR"
+      }
+    }
+  },
+  "image_urls": {
+    "sample_guests_1": "https://images.unsplash.com/photo-1727764894973-28e7283a600c?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "sample_booth_vintage": "https://images.unsplash.com/photo-1778641603107-850c6a5f66c0?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "sample_couple_selfie": "https://images.unsplash.com/photo-1646381590604-116b057d5888?crop=entropy&cs=srgb&fm=jpg&q=85",
+    "sample_wedding_guests": "https://images.unsplash.com/photo-1761933804872-2a91a55ccb2c?crop=entropy&cs=srgb&fm=jpg&q=85"
+  },
+  "test_attributes": {
+    "convention": "kebab-case, role-based, unique data-testid on every interactive element and data readout",
+    "required_test_ids": [
+      "kiosk-attract-start-button",
+      "kiosk-language-toggle",
+      "kiosk-template-option-card",
+      "kiosk-filter-option-button",
+      "kiosk-countdown-display",
+      "kiosk-camera-live-feed",
+      "kiosk-retake-button",
+      "kiosk-confirm-print-button",
+      "kiosk-qr-code-image",
+      "kiosk-hidden-admin-area",
+      "kiosk-pin-input",
+      "admin-nav-events-link",
+      "admin-nav-templates-link",
+      "admin-nav-hardware-link",
+      "admin-nav-gallery-link",
+      "admin-kiosk-launcher-button",
+      "hardware-camera-status-badge",
+      "hardware-printer-status-badge",
+      "hardware-paper-gauge-bar",
+      "guest-gallery-download-all-button",
+      "guest-gallery-share-button"
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Ensure all components use standard .jsx / .js React files matching CRA / Craco structure.",
+    "Do not use universal CSS transitions like transition: all; always specify opacity, transform, background-color.",
+    "Use Lucide icons (lucide-react) for UI icons (e.g. Camera, Printer, QrCode, RefreshCw, Settings, Sparkles, Volume2, VolumeX, Shield, LayoutGrid).",
+    "Use Sonner for admin toast notifications.",
+    "Maintain strict touch target minimums (min 64px x 64px clickable area) for all guest-facing Kiosk buttons.",
+    "Always set explicit hover and focus text colors (e.g., hover:bg-rose-600 hover:text-white).",
+    "All key interactive elements MUST include explicit data-testid attributes."
+  ]
+}

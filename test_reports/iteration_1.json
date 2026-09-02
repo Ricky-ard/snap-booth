@@ -1,0 +1,58 @@
+{
+  "summary": "First full test run of SnapBooth. Backend: created pytest suite (48 tests) covering health, seed data, JWT auth (cookie + Bearer + PIN), events/templates/presets CRUD + auth guards, full kiosk session flow, print composition dimensions/DPI for all 5 templates, retake slot-replacement, print job lifecycle (mock driver queued->printing->done), hardware status fallback, stats, public guest gallery (JSON/zip/lead/QR), file serving and expired-QR 410 behavior — 48/48 passing. Frontend: verified kiosk idle screen with seeded Demo Wedding event, EN/ID i18n toggle, mute toggle, hidden-corner triple-tap -> PIN modal (wrong PIN rejected with 'Wrong PIN' toast, 1234 redirects to /admin/login), template step (5 layouts), filter step (12 presets + Start), admin login (wrong password -> toast, correct -> /admin with sb_token mirrored to localStorage, session persists on reload, logout clears token and redirects), all 5 admin nav pages load real data (dashboard stats, events, template designer save, 12 filter cards with persisted enable toggle, hardware diagnostics with mock/webcam badges + populated print queue), and the public /g/{token} gallery on mobile viewport (no auth, images render, ZIP download fires, share button works, bad token shows 'Photos not found'). One HIGH severity global CSS contrast defect found on the kiosk. Webcam capture steps were not exercised (headless) per instructions.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/presets", "issue": "Admin-only (401 without auth) although the request brief described it as returning 12 enabled entries; kiosk gets presets via /api/events/active instead. Behavior is consistent, just documentation mismatch."},
+      {"endpoint": "POST /api/print/{sid}", "issue": "Public/unauthenticated with an unbounded `copies` query param — any client can queue N copies for any finalized session id. Consider clamping to event.max_copies."},
+      {"endpoint": "JWT", "issue": "Default JWT_SECRET is 30 bytes -> PyJWT InsecureKeyLengthWarning logged on every encode/decode. Set a >=32 byte JWT_SECRET."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "Global theme / Kiosk.jsx", "issue": "HIGH: index.css applies `body { @apply bg-background text-foreground }` with the LIGHT :root palette (foreground = rgb(10,10,10)) and the app never adds the `dark` class to <html>. On the dark kiosk background (rgb(10,13,20)) every element that inherits body color is effectively invisible (contrast ~1.02:1): 'Choose a Print Layout' heading, template names, 'Choose a style' heading, filter preset name labels, the outline 'Back' button label (renders as an empty box), PIN modal title/OK-Cancel labels, and the EN·ID / mute icons. Fix: add `dark` class to <html> (or set explicit text-white/text-slate-100 on kiosk containers).", "selector": "body, [data-testid=\"kiosk-template-option-card\"], [data-testid=\"kiosk-filter-option-button\"]", "priority": "HIGH"},
+      {"component": "Admin/Hardware.jsx", "issue": "data-testid=\"hardware-paper-gauge-bar\" only renders when the Booth Bridge is connected, so it is absent in this (mock) environment — the request lists it as a required element. Render a disabled/zeroed gauge when driver=mock.", "selector": "[data-testid=\"hardware-paper-gauge-bar\"]", "priority": "MEDIUM"},
+      {"component": "Kiosk.jsx PIN modal", "issue": "PIN only submits via the OK button; Enter key does not submit and there is no numeric keypad, which is awkward on a touch kiosk.", "selector": "[data-testid=\"kiosk-pin-input\"]", "priority": "LOW"},
+      {"component": "Admin/Gallery.jsx", "issue": "Session history lists abandoned 'capturing' sessions as blank/'In progress' cards with no way to delete them from the UI (DELETE /api/sessions/{id} exists in backend).", "selector": "[data-testid=\"admin-gallery-session-card\"]", "priority": "LOW"},
+      {"component": "Kiosk filter step", "issue": "Filter thumbnails preview a hardcoded external Unsplash portrait rather than a frame from the live camera, so the guest cannot see the filter on themselves before choosing.", "selector": "[data-testid=\"kiosk-filter-option-button\"] div", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Kiosk template/filter/PIN screens", "issues": ["Near-zero text contrast (see HIGH bug above)", "Outline 'Back' button appears as an empty bordered box"]},
+      {"screen": "Admin Hardware", "issues": ["Values show '…' / 'GB free of GB' for ~1-2s on first paint because /api/hardware/status waits on the 1s bridge probe — no skeleton/loading state"]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/make_seed_session.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "FIX HIGH: add the `dark` class to <html> (index.js/App.js) or set explicit light text colors on kiosk screens — kiosk headings, template names, filter labels and the Back button are currently invisible dark-on-dark.",
+    "Render hardware-paper-gauge-bar (empty/mock state) when Booth Bridge is absent so the element always exists.",
+    "Clamp POST /api/print/{sid}?copies= to event.max_copies and consider rate limiting (endpoint is public).",
+    "Set a >=32 byte JWT_SECRET in backend/.env to silence InsecureKeyLengthWarning.",
+    "Optional: allow Enter-to-submit on the kiosk PIN input; add delete control for abandoned sessions in Admin Gallery."
+  ],
+  "critical_code_review_comments": [
+    "server.py compose/finalize is fully synchronous CPU work (Pillow + numpy) inside the event loop — a 1200x1800 quad compose blocks all other requests; move compose_print to a thread (run_in_executor / asyncio.to_thread).",
+    "GET /api/files/{path:path} joins user input onto STORAGE without normalization; traversal attempts currently 404 (Starlette normalizes the URL) but the code should still resolve() and assert the path is inside STORAGE.",
+    "compose_print maps duplicated slots with `i % len(photo_paths)` — for tpl-strip-double with fewer photos than slots the mapping silently wraps instead of leaving the slot empty; verify intent.",
+    "apply_filter_pil contains a dead no-op branch (the 'Sepia after channel ops' if-block) — remove.",
+    "sessions/photo trusts arbitrary base64 with no size limit; add a max payload/dimension guard.",
+    "Frontend has no `dark` class bootstrap while all pages assume the dark palette — root cause of the contrast defect."
+  ],
+  "updated_files": [
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/make_seed_session.py"
+  ],
+  "success_rate": {"backend": "100% (48/48 pytest)", "frontend": "~90% (all flows work; 1 HIGH contrast defect + 1 missing testid)"},
+  "seed_data_creation": "Created several kiosk sessions via API for print-dimension/gallery tests (TEST_ prefixed events/templates were created and deleted). Verified final state restored: 5 seeded templates, 12 enabled presets, single active 'Demo Wedding' event. A reusable finalized session token for guest-gallery UI testing can be regenerated with `python /app/backend/tests/make_seed_session.py`.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "admin password `snapbooth`, kiosk PIN `1234` (from /app/memory/test_credentials.md) — both valid.",
+  "context_for_next_testing_agent": "Backend suite lives at /app/backend/tests (conftest.py + backend_test.py, run with `cd /app/backend && python -m pytest tests/ -q`); it is self-cleaning (TEST_ prefixed data deleted, active event restored). DPI assertions use a tolerance because PNG pHYs stores px/meter as int -> 299.9994. Webcam capture (kiosk countdown/review/delivery) is still untested — cannot run headless; drive it via make_seed_session.py + backend curls. After the dark-theme fix, re-verify kiosk template/filter/PIN screen text visibility and check the delivery screen (kiosk-qr-code-image, kiosk-print-again-button, kiosk-done-button) which was never reached in the UI.",
+  "rca_of_the_issue": "Contrast defect RCA: /app/frontend/src/index.css defines shadcn CSS variables for both light (:root) and dark (.dark) themes and applies `body { @apply bg-background text-foreground }`. No component or entry point ever adds the `dark` class to <html>/<body>, so --foreground resolves to 0 0% 3.9% (near black). Kiosk screens rely on inherited body color for headings/labels while using the custom .kiosk-bg dark gradient (#0A0D14), giving ~1.02:1 contrast. Reproduce: open /kiosk, tap TAP TO START -> the 'Choose a Print Layout' heading and template names are unreadable; getComputedStyle(document.body).color === 'rgb(10, 10, 10)'. Admin pages are unaffected only because they hardcode text colors."
+}
