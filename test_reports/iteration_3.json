@@ -1,0 +1,54 @@
+{
+  "summary": "Verified the SnapBooth kiosk live-feed-during-countdown structural fix with a canvas-backed getUserMedia stub. ALL 6 bug-fix acceptance criteria PASS (single gUM call, persistent <video> DOM node, transparent pointer-events:none countdown overlay, CSS filter retained, 141-144ms flash, 2.0s still preview with data:image src, video visible in 308/308 countdown samples). Backend regression suite: 74/74 passed. HOWEVER a CRITICAL functional regression was found in the same rewrite: /api/sessions/photo is NEVER called for the shots taken in the first pass (stale `session` closure), so the composed print and guest gallery come back with EMPTY photo slots and the guest sees an 'Upload failed' toast. Boomerang upload fails for the same reason.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Capture -> photo upload (/api/sessions/photo)",
+        "issue": "CRITICAL: No POST /api/sessions/photo request is ever issued for shots captured in the normal flow. Network trace for a full 1-photo session shows only 'POST /sessions/start' (200) and then finalize; guest gallery returns raw_photos: [] and the composed print PNG has blank photo slots. Root cause: startCapture() calls runCountdown() from the same render closure in which `session` is still null, so captureShot() evaluates `session.id` -> TypeError, swallowed by the try/catch which shows toast.error('Upload failed'). Proof: clicking kiosk-retake-button (which runs from a later render where `session` is set) DOES produce 'POST /sessions/photo 200'.",
+        "affected_selectors": ["[data-testid=kiosk-still-preview]", "[data-testid=kiosk-confirm-print-button]", "[data-sonner-toast]"]
+      },
+      {
+        "flow": "Boomerang capture (Square Social 1:1 template)",
+        "issue": "CRITICAL: 'Boomerang failed' toast and no kiosk-boomerang-preview on review for the first pass. Same stale-closure cause — captureBoomerang() reads `session.id` from the render where session was still null. Works after a retake.",
+        "affected_selectors": ["[data-testid=kiosk-boomerang-status]", "[data-testid=kiosk-boomerang-preview]"]
+      },
+      {
+        "flow": "Finalize / delivery",
+        "issue": "Finalize succeeds and kiosk-qr-code-image renders, but because no raw photo ever reached the backend the print (600x1800) contains only the template chrome (SNAPBOOTH / MEMORIES text) with empty slots — guest receives an empty strip.",
+        "affected_selectors": ["[data-testid=kiosk-qr-code-image]"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "CRITICAL: fix the stale `session` closure in Kiosk.jsx. Store the started session in a ref (e.g. sessionRef.current = r.data) or pass the session object explicitly into runCountdown(n, sess) -> captureShot(n, sess) so /api/sessions/photo and /api/sessions/boomerang receive a valid session_id on the FIRST pass.",
+    "Do not swallow real JS exceptions in captureShot/captureBoomerang: `catch { toast.error('Upload failed') }` hides a TypeError. Log the error (console.error) and only show the toast for genuine HTTP failures.",
+    "Consider guarding finalize: if no photo_paths exist on the session, surface an error instead of producing an empty print.",
+    "runCountdown's setInterval is never stored/cleared — an idle timeout or goIdle() during a countdown leaves the interval running and will still fire captureShot on an already-reset session. Keep the interval id in a ref and clear it in goIdle()/unmount.",
+    "step === 'template-auto' invokes setTimeout(beginSessionFromTemplate) inside the render body (side effect during render). Move to a useEffect."
+  ],
+  "critical_code_review_comments": [
+    "Kiosk.jsx:136-143 — startCapture() calls setSession(r.data) and then immediately runCountdown(0) from the SAME closure; every function reached from that closure (captureShot, captureBoomerang) sees session === null. This is the single cause of the upload/boomerang failures.",
+    "Kiosk.jsx:184-188 / 224-227 — bare `catch {}` blocks mask programming errors as user-facing 'Upload failed'/'Boomerang failed' toasts, which is why the regression produced no console errors and no 4xx/5xx in the network log.",
+    "Kiosk.jsx:145-163 — interval handle not retained; no cleanup on unmount or goIdle.",
+    "Kiosk.jsx:176 — ctx.filter is set AFTER ctx.drawImage, so the CSS-preset parity filter has no effect on the captured JPEG (filter must be assigned before drawing).",
+    "Kiosk.jsx is 553 lines and mixes 9 step views + capture logic; approaching the 700-line split threshold — consider extracting the step overlays."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (74/74 pytest)", "frontend": "bug-fix criteria 6/6 PASS; end-to-end capture persistence FAILS (0% of first-pass photos uploaded)"},
+  "seed_data_creation": "Created 3 kiosk sessions via the public flow (tokens BQk4MA3p-Kw, UgHwpCnz1Z8 + one boomerang session). All have empty raw_photos due to the bug above; safe to delete.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "/app/memory/test_credentials.md — admin password 'snapbooth', kiosk PIN 1234 (not needed for kiosk flow)",
+  "context_for_next_testing_agent": "Use the canvas-backed getUserMedia stub via page.add_init_script + context.grant_permissions(['camera']) — headless Chromium otherwise has no camera. Instrumentation that worked: a 40ms setInterval poller sampling getComputedStyle of [data-testid=kiosk-camera-live-feed] and kiosk-countdown-overlay while the countdown overlay exists, plus a MutationObserver counting mounts/unmounts of kiosk-live-feed-layer (wrap in try/catch: an exception in the init script silently kills later instrumentation). Verified metrics on this build: gumCalls=1, feedUnmounts=0, videoUnmounts=0, overlay bg rgba(0,0,0,0), pointer-events none, position fixed, video filter 'brightness(1) contrast(1) saturate(1.08)...' during countdown, flash 141/144ms, still preview 2002/2020ms, still img src data:image/jpeg. When re-testing the fix, the decisive assertion is a network listener for 'POST /api/sessions/photo' returning 200 once per shot AND GET /api/g/{token} showing raw_photos with one entry per slot. Template order: 0=4x6 Quad Grid(4), 1=4x6 Portrait(1, fastest), 2=Classic 2x6 Strip(3), 3=Square Social 1:1(boomerang), 4=2x6 Duo(3). No active preset has lut_path, so the WebGL LUT path (kiosk-lut-canvas) was NOT exercised.",
+  "rca_of_the_issue": "The countdown live-feed bug is genuinely fixed: one MediaStream from the Zustand store, one persistent <video> inside kiosk-live-feed-layer that is never unmounted across filter->countdown->stillPreview->review, and transparent pointer-events:none overlays. The new defect is a React stale-closure: startCapture() does setSession(r.data) then synchronously calls runCountdown(0); the nested captureShot(n) captures `session` from the pre-update render (null), so `session.id` throws a TypeError inside the try block and the POST /api/sessions/photo never fires. Reproduction: /kiosk -> Start -> template #2 (4x6 Portrait) -> Start -> observe 'Upload failed' toast, no /sessions/photo in the network log, and GET /api/g/{token} -> raw_photos: []. Mitigation: keep the session in a ref or thread it through runCountdown/captureShot arguments."
+}

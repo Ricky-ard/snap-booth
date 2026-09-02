@@ -8,15 +8,23 @@ import { paramsToCss } from "@/lib/filters";
 import { beep, shutter, chime } from "@/lib/audio";
 import { attachLutRenderer, loadStripImage } from "@/lib/webglLut";
 import { useConnectivity } from "@/lib/connectivity";
+import { useKiosk } from "@/store/kiosk";
 import { Button } from "@/components/ui/button";
 
-const STEPS = ["idle", "template", "filter", "countdown", "review", "processing", "delivery"];
-
+/**
+ * Session-scoped live feed: the SAME <video> element and its Zustand-held
+ * MediaStream stay mounted across filter → countdown → still-preview → review
+ * steps. Countdown, flash, and still-preview are transparent overlays on top.
+ */
 export default function Kiosk() {
   const { t, lang, setLang } = useLang();
   const { online, lan } = useConnectivity();
+  const acquire = useKiosk((s) => s.acquire);
+  const release = useKiosk((s) => s.release);
+  const stream = useKiosk((s) => s.stream);
+
   const [bundle, setBundle] = useState(null);
-  const [step, setStep] = useState("idle");
+  const [step, setStep] = useState("idle"); // idle | template | filter | countdown | stillPreview | boomerang | review | processing | delivery
   const [template, setTemplate] = useState(null);
   const [preset, setPreset] = useState(null);
   const [session, setSession] = useState(null);
@@ -24,65 +32,64 @@ export default function Kiosk() {
   const [count, setCount] = useState(0);
   const [flash, setFlash] = useState(false);
   const [photos, setPhotos] = useState([]);
+  const [lastShotPreview, setLastShotPreview] = useState(null);
   const [finalized, setFinalized] = useState(null);
   const [muted, setMuted] = useState(false);
   const [copies, setCopies] = useState(1);
   const [pinOpen, setPinOpen] = useState(false);
   const [pin, setPin] = useState("");
   const [triple, setTriple] = useState([]);
-  const [boomerang, setBoomerang] = useState(null); // {gif_path, mp4_path} | "capturing"
+  const [boomerang, setBoomerang] = useState(null);
+
   const videoRef = useRef(null);
-  const streamRef = useRef(null);
   const lutCanvasRef = useRef(null);
   const lutControllerRef = useRef(null);
   const idleTimer = useRef(null);
+  const sessionRef = useRef(null);          // authoritative session across closures
+  const countdownIv = useRef(null);         // outstanding setInterval handle
+
+  // The kiosk shows the persistent live feed for every "session-active" step
+  const sessionActive = ["filter", "countdown", "stillPreview", "review", "boomerang"].includes(step);
 
   // Load active event bundle
   useEffect(() => {
-    api.get("/events/active").then(r => {
+    api.get("/events/active").then((r) => {
       setBundle(r.data);
       setMuted(!!r.data.event?.mute);
     }).catch(() => {});
   }, []);
 
-  // Start webcam whenever we enter template/filter/countdown/review
+  // Attach the ONE MediaStream to our ONE <video> element the first time we
+  // enter a session-active step. Re-run only if the stream reference changes.
   useEffect(() => {
-    const need = ["filter", "countdown", "review"].includes(step);
-    if (need && !streamRef.current) {
-      navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: "user" }, audio: false })
-        .then(s => { streamRef.current = s; if (videoRef.current) videoRef.current.srcObject = s; })
-        .catch(() => toast.error(t("camera_denied")));
+    if (!sessionActive) return;
+    if (!videoRef.current) return;
+    if (stream) {
+      if (videoRef.current.srcObject !== stream) videoRef.current.srcObject = stream;
+      videoRef.current.play?.().catch(() => {});
     }
-    if (step === "idle" && streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
-  }, [step, t]);
+  }, [sessionActive, stream]);
 
-  // Attach WebGL LUT renderer when the picked preset has a .cube attached.
+  // WebGL LUT renderer — attached when the picked preset has a .cube
   useEffect(() => {
-    // Tear down previous renderer whenever preset changes
     if (lutControllerRef.current) {
       lutControllerRef.current.stop();
       lutControllerRef.current = null;
     }
-    if (!preset?.lut_path || !videoRef.current || !lutCanvasRef.current) return;
+    if (!preset?.lut_path || !videoRef.current || !lutCanvasRef.current || !stream) return;
     let cancelled = false;
     (async () => {
       try {
         const img = await loadStripImage(`${process.env.REACT_APP_BACKEND_URL}/api/presets/${preset.id}/lut.png`);
         if (cancelled) return;
-        const size = preset.lut_size || 17;
-        const ctl = attachLutRenderer(lutCanvasRef.current, videoRef.current, img, size);
+        const ctl = attachLutRenderer(lutCanvasRef.current, videoRef.current, img, preset.lut_size || 17);
         if (ctl) { ctl.setMirror(true); lutControllerRef.current = ctl; }
-      } catch (e) {
-        console.warn("LUT attach failed", e);
-      }
+      } catch (e) { console.warn("LUT attach failed", e); }
     })();
     return () => { cancelled = true; };
-  }, [preset]);
+  }, [preset, stream]);
 
-  // Reset idle timer on any interaction
+  // Idle timer — resets on any interaction; goes home after event.idle_timeout
   const resetIdle = useCallback(() => {
     if (idleTimer.current) clearTimeout(idleTimer.current);
     if (step !== "idle") {
@@ -90,58 +97,80 @@ export default function Kiosk() {
       idleTimer.current = setTimeout(() => goIdle(), to);
     }
   }, [step, bundle]);
+  useEffect(() => { resetIdle(); return () => idleTimer.current && clearTimeout(idleTimer.current); }, [resetIdle]);
 
+  // Single-template shortcut: auto-advance to filter once bundle is ready.
+  // (Doing this in a useEffect avoids the "side effect during render" pattern.)
   useEffect(() => {
-    resetIdle();
-    return () => idleTimer.current && clearTimeout(idleTimer.current);
-  }, [resetIdle]);
+    if (step === "template-auto" && bundle?.templates?.length) {
+      beginSessionFromTemplate(bundle.templates[0]);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, bundle]);
 
   function goIdle() {
-    setStep("idle"); setTemplate(null); setPreset(null); setSession(null);
+    if (countdownIv.current) { clearInterval(countdownIv.current); countdownIv.current = null; }
+    setStep("idle"); setTemplate(null); setPreset(null); setSession(null); sessionRef.current = null;
     setShotIndex(0); setPhotos([]); setFinalized(null); setCopies(1);
-    setBoomerang(null);
+    setBoomerang(null); setLastShotPreview(null);
+    release();  // stop the camera tracks only when we truly leave the session
   }
 
-  // Triple-tap hidden admin gesture
   function onCornerTap() {
     const now = Date.now();
-    const arr = [...triple, now].filter(t => now - t < 1500);
+    const arr = [...triple, now].filter((tt) => now - tt < 1500);
     setTriple(arr);
     if (arr.length >= 3) { setPinOpen(true); setTriple([]); }
   }
 
   async function submitPin() {
-    try {
-      await api.post("/auth/verify-pin", { pin });
-      window.location.href = "/admin/login";
-    } catch { toast.error("Wrong PIN"); }
+    try { await api.post("/auth/verify-pin", { pin }); window.location.href = "/admin/login"; }
+    catch { toast.error("Wrong PIN"); }
     setPin("");
   }
 
-  // Start a session after picking a template
-  async function beginSession(tpl, prs) {
+  // --- Session start: acquire camera ONCE, transition into the filter step
+  async function beginSessionFromTemplate(tpl) {
+    setTemplate(tpl);
+    try {
+      await acquire();  // idempotent — the stream survives every subsequent step
+    } catch {
+      toast.error(t("camera_denied"));
+      return;
+    }
+    if (bundle?.presets?.[0]) setPreset(bundle.presets[0]);
+    setStep("filter");
+  }
+
+  async function startCapture() {
+    if (!template || !preset) return;
     try {
       const r = await api.post("/sessions/start", {
-        event_id: bundle.event.id, template_id: tpl.id, preset_id: prs.id,
+        event_id: bundle.event.id, template_id: template.id, preset_id: preset.id,
       });
+      // Persist to a ref so captureShot/captureBoomerang see the id even in the
+      // very first render pass (React state updates are async — closures below
+      // would otherwise read `session === null` and throw).
+      sessionRef.current = r.data;
       setSession(r.data); setShotIndex(0); setPhotos([]);
       setStep("countdown");
       runCountdown(0);
-    } catch (e) { toast.error("Could not start session"); }
+    } catch (e) { console.error("session start failed", e); toast.error("Could not start session"); }
   }
 
-  // Countdown then capture, for shot index n
   function runCountdown(n) {
+    if (countdownIv.current) { clearInterval(countdownIv.current); countdownIv.current = null; }
     let c = 5;
     setCount(c);
-    const iv = setInterval(() => {
+    countdownIv.current = setInterval(() => {
       c -= 1;
       if (c <= 0) {
-        clearInterval(iv);
+        clearInterval(countdownIv.current); countdownIv.current = null;
         setCount(0);
+        // Flash for exactly ~150ms while we grab the still
         setFlash(true);
         shutter(muted);
-        setTimeout(() => setFlash(false), 350);
+        setTimeout(() => setFlash(false), 150);
         captureShot(n);
       } else {
         setCount(c);
@@ -152,41 +181,52 @@ export default function Kiosk() {
 
   async function captureShot(n) {
     const v = videoRef.current;
-    if (!v) return;
+    const sess = sessionRef.current;
+    if (!v || !sess) { console.error("captureShot: video or session missing", { v: !!v, sess: !!sess }); return; }
     const canvas = document.createElement("canvas");
     canvas.width = v.videoWidth || 1280;
     canvas.height = v.videoHeight || 720;
     const ctx = canvas.getContext("2d");
-    // Mirror horizontally (front camera preview)
+    // Set CSS filter BEFORE drawImage so preset parity is baked into the JPEG
+    if (preset && !preset.lut_path) ctx.filter = paramsToCss(preset.params);
+    // Mirror horizontally to match the on-screen preview
     ctx.translate(canvas.width, 0); ctx.scale(-1, 1);
     ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
     const dataUrl = canvas.toDataURL("image/jpeg", 0.92);
+
+    // Show a still preview OVER the running video for exactly 2s
+    setLastShotPreview(dataUrl);
+    setPhotos((prev) => { const c = [...prev]; c[n] = dataUrl; return c; });
+    setStep("stillPreview");
+
     try {
       await api.post("/sessions/photo", {
-        session_id: session.id, slot_index: n, image_base64: dataUrl,
+        session_id: sess.id, slot_index: n, image_base64: dataUrl,
       });
-      setPhotos(prev => { const c = [...prev]; c[n] = dataUrl; return c; });
-    } catch { toast.error("Upload failed"); }
+    } catch (e) {
+      console.error("photo upload failed", e);
+      toast.error("Upload failed");
+    }
 
-    // brief hold, then next shot or review
     setTimeout(() => {
+      setLastShotPreview(null);
       const total = template?.photo_count || 1;
       if (n + 1 < total) {
         setShotIndex(n + 1);
+        setStep("countdown");
         runCountdown(n + 1);
       } else if (template?.is_boomerang) {
         captureBoomerang();
       } else {
         setStep("review");
       }
-    }, 1500);
+    }, 2000);
   }
 
-  // Boomerang burst: 12 frames at 10fps -> POST to backend for GIF+MP4 encoding
   async function captureBoomerang() {
-    setStep("boomerang");
-    setBoomerang("capturing");
-    beep(1200, 60, muted);
+    const sess = sessionRef.current;
+    if (!sess) { console.error("captureBoomerang: session missing"); setStep("review"); return; }
+    setStep("boomerang"); setBoomerang("capturing"); beep(1200, 60, muted);
     const v = videoRef.current;
     if (!v) { setStep("review"); return; }
     const frames = [];
@@ -197,23 +237,20 @@ export default function Kiosk() {
     for (let i = 0; i < 12; i++) {
       ctx.save();
       ctx.setTransform(1, 0, 0, 1, 0, 0);
+      if (preset && !preset.lut_path) ctx.filter = paramsToCss(preset.params);
       ctx.translate(canvas.width, 0); ctx.scale(-1, 1);
       ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
       ctx.restore();
       frames.push(canvas.toDataURL("image/jpeg", 0.82));
-      // 100ms between frames = 10 fps burst
       await new Promise((r) => setTimeout(r, 100));
     }
     beep(400, 100, muted);
     try {
-      const r = await api.post("/sessions/boomerang", {
-        session_id: session.id, frames, fps: 10,
-      });
-      setBoomerang(r.data);
-      chime(muted);
+      const r = await api.post("/sessions/boomerang", { session_id: sess.id, frames, fps: 10 });
+      setBoomerang(r.data); chime(muted);
     } catch (e) {
-      console.warn("boomerang encode failed", e);
-      toast.error("Boomerang failed — keeping your prints");
+      console.error("boomerang upload failed", e);
+      toast.error("Boomerang failed");
       setBoomerang(null);
     }
     setStep("review");
@@ -224,23 +261,38 @@ export default function Kiosk() {
   }
 
   async function finalize() {
+    const sess = sessionRef.current;
+    if (!sess) return;
+    // Guard: if the backend has no photos, surface it clearly instead of
+    // rendering an empty print with only template chrome.
+    try {
+      const check = await api.get(`/sessions/${sess.id}`);
+      const paths = (check.data.photo_paths || []).filter(Boolean);
+      if (paths.length === 0) {
+        console.error("finalize aborted: no uploaded photos");
+        toast.error("No photos uploaded — check camera & try again");
+        return;
+      }
+    } catch (e) { console.error("finalize precheck failed", e); }
+
     setStep("processing");
     try {
-      const r = await api.post(`/sessions/${session.id}/finalize`);
-      setFinalized(r.data);
-      chime(muted);
-      setStep("delivery");
+      const r = await api.post(`/sessions/${sess.id}/finalize`);
+      setFinalized(r.data); chime(muted); setStep("delivery");
     } catch (e) {
-      toast.error("Could not compose print — returning to idle");
+      console.error("finalize failed", e);
+      toast.error("Could not compose print");
       setTimeout(goIdle, 3000);
     }
   }
 
   async function printNow() {
+    const sess = sessionRef.current;
+    if (!sess) return;
     try {
-      await api.post(`/print/${session.id}?copies=${copies}`);
+      await api.post(`/print/${sess.id}?copies=${copies}`);
       toast.success(`Sent ${copies} copy${copies > 1 ? "ies" : ""} to printer`);
-    } catch { toast.error("Print queue error"); }
+    } catch (e) { console.error("print failed", e); toast.error("Print queue error"); }
   }
 
   if (!bundle) {
@@ -256,26 +308,22 @@ export default function Kiosk() {
 
   return (
     <div className="kiosk-bg no-scroll relative select-none" onPointerDown={resetIdle}>
-      {/* Hidden admin corner */}
+      {/* Hidden admin corner (triple-tap top-left) */}
       <div data-testid="kiosk-hidden-admin-area"
-           className="fixed top-0 left-0 w-20 h-20 z-50"
+           className="fixed top-0 left-0 w-20 h-20 z-[60]"
            onClick={onCornerTap} />
 
-      {/* Mute toggle top-right */}
-      <button data-testid="kiosk-mute-toggle"
-        onClick={() => setMuted(m => !m)}
+      {/* Mute + language toggles */}
+      <button data-testid="kiosk-mute-toggle" onClick={() => setMuted((m) => !m)}
         className="fixed top-4 right-4 z-40 w-16 h-16 rounded-full bg-white/10 backdrop-blur border border-white/20 flex items-center justify-center hover:bg-white/20">
         {muted ? <VolumeX className="w-6 h-6" /> : <Volume2 className="w-6 h-6" />}
       </button>
-
-      {/* Language toggle */}
-      <button data-testid="kiosk-language-toggle"
-        onClick={() => setLang(lang === "en" ? "id" : "en")}
+      <button data-testid="kiosk-language-toggle" onClick={() => setLang(lang === "en" ? "id" : "en")}
         className="fixed top-4 right-24 z-40 h-16 px-5 rounded-full bg-white/10 backdrop-blur border border-white/20 font-mono text-sm uppercase tracking-wider">
         {lang.toUpperCase()} · {lang === "en" ? "ID" : "EN"}
       </button>
 
-      {/* Connectivity chip — kiosk keeps working offline; this reassures the operator */}
+      {/* Connectivity chips */}
       {!online && lan && (
         <div data-testid="kiosk-offline-chip"
           className="fixed bottom-4 left-4 z-40 px-3 py-1.5 rounded-full bg-amber-500/25 border border-amber-400/60 text-amber-100 text-xs font-mono uppercase tracking-widest backdrop-blur">
@@ -289,22 +337,45 @@ export default function Kiosk() {
         </div>
       )}
 
-      {/* Flash overlay */}
-      {flash && <div className="animate-flash fixed inset-0 bg-white z-[100] pointer-events-none" />}
+      {/* -------- Persistent Live Feed (mounts once, stays mounted) -------- */}
+      {sessionActive && (
+        <div data-testid="kiosk-live-feed-layer" className="fixed inset-0 z-0 bg-black">
+          <video
+            ref={videoRef}
+            data-testid="kiosk-camera-live-feed"
+            autoPlay
+            playsInline
+            muted
+            className="w-full h-full object-cover"
+            style={{
+              transform: "scaleX(-1)",
+              filter: preset?.lut_path ? "none" : cssFilter,
+              visibility: preset?.lut_path ? "hidden" : "visible",
+            }}
+          />
+          {preset?.lut_path && (
+            <canvas
+              ref={lutCanvasRef}
+              data-testid="kiosk-lut-canvas"
+              className="absolute inset-0 w-full h-full object-cover"
+            />
+          )}
+        </div>
+      )}
 
+      {/* -------- Step overlays (always transparent on top of the video) -------- */}
       <AnimatePresence mode="wait">
         {step === "idle" && (
           <motion.div key="idle" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
-            className="w-full h-screen flex flex-col items-center justify-center px-8">
-            <motion.div initial={{y:20,opacity:0}} animate={{y:0,opacity:1}} transition={{delay:0.1}}
-              className="text-center">
+            className="w-full h-screen flex flex-col items-center justify-center px-8 relative z-10">
+            <motion.div initial={{y:20,opacity:0}} animate={{y:0,opacity:1}} transition={{delay:0.1}} className="text-center">
               {ev.logo_url && <img src={ev.logo_url} className="h-24 mx-auto mb-8" alt="" />}
               <div className="text-xs font-mono uppercase tracking-[0.4em] text-slate-400 mb-4">SNAPBOOTH · {ev.date}</div>
               <h1 className="text-5xl sm:text-7xl font-extrabold tracking-tight mb-3" style={{color: ev.color || "#f43f5e"}}>{ev.headline}</h1>
               <p className="text-lg text-slate-300 mb-16">{ev.client}</p>
             </motion.div>
             <motion.button data-testid="kiosk-attract-start-button"
-              onClick={() => setStep(bundle.templates.length === 1 ? "filter" : "template")}
+              onClick={() => setStep(bundle.templates.length === 1 ? "template-auto" : "template")}
               initial={{scale:0.9}} animate={{scale:1}}
               className="animate-pulse-glow px-16 py-8 rounded-full bg-gradient-to-r from-amber-400 via-rose-500 to-fuchsia-600 text-white text-3xl font-black tracking-wide hover:scale-105 active:scale-95 transition-transform">
               {t("tap_to_start")}
@@ -315,12 +386,12 @@ export default function Kiosk() {
 
         {step === "template" && (
           <motion.div key="template" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
-            className="w-full h-screen flex flex-col p-12">
+            className="w-full h-screen flex flex-col p-12 relative z-10">
             <h2 className="text-3xl font-bold mb-8">{t("choose_template")}</h2>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-6 flex-1 overflow-auto">
-              {bundle.templates.map(tpl => (
+              {bundle.templates.map((tpl) => (
                 <button key={tpl.id} data-testid="kiosk-template-option-card"
-                  onClick={() => { setTemplate(tpl); setStep("filter"); if (bundle.presets[0]) setPreset(bundle.presets[0]); }}
+                  onClick={() => beginSessionFromTemplate(tpl)}
                   className="group bg-white/5 border border-white/10 rounded-3xl p-6 flex flex-col items-center hover:border-rose-500 hover:scale-[1.02] active:scale-95 transition-transform">
                   <div className="w-40 h-52 bg-slate-800 rounded-xl mb-4 relative overflow-hidden" style={{background: tpl.background_color || "#111"}}>
                     {(tpl.photo_slots || []).slice(0, 4).map((s, i) => (
@@ -342,25 +413,21 @@ export default function Kiosk() {
           </motion.div>
         )}
 
+        {/* Auto-skip: single-template events go straight into filter picker.
+            The actual transition is driven by the useEffect above so we don't
+            trigger a side effect during render. */}
+        {step === "template-auto" && null}
+
         {step === "filter" && (
           <motion.div key="filter" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
-            className="w-full h-screen relative">
-            <video ref={videoRef} data-testid="kiosk-camera-live-feed"
-              autoPlay playsInline muted
-              className="w-full h-full object-cover"
-              style={{transform:"scaleX(-1)", filter: cssFilter, visibility: preset?.lut_path ? "hidden" : "visible"}} />
-            {preset?.lut_path && (
-              <canvas ref={lutCanvasRef} data-testid="kiosk-lut-canvas"
-                className="absolute inset-0 w-full h-full object-cover pointer-events-none" />
-            )}
-            <div className="absolute top-8 left-0 right-0 text-center">
-              <h2 className="text-3xl font-bold">{t("choose_filter")}</h2>
+            className="fixed inset-0 z-10">
+            <div className="absolute top-8 left-0 right-0 text-center pointer-events-none">
+              <h2 className="text-3xl font-bold drop-shadow-[0_2px_10px_rgba(0,0,0,0.9)]">{t("choose_filter")}</h2>
             </div>
-            <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
+            <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 via-black/40 to-transparent">
               <div className="flex gap-3 overflow-x-auto pb-4 mb-6">
-                {bundle.presets.map(p => (
-                  <button key={p.id} data-testid="kiosk-filter-option-button"
-                    onClick={() => setPreset(p)}
+                {bundle.presets.map((p) => (
+                  <button key={p.id} data-testid="kiosk-filter-option-button" onClick={() => setPreset(p)}
                     className={`flex-shrink-0 rounded-2xl border-2 transition-all p-2 ${preset?.id === p.id ? "border-rose-500 shadow-[0_0_25px_rgba(244,63,94,0.4)]" : "border-white/10"}`}>
                     <div className="w-20 h-20 rounded-xl bg-cover bg-center"
                       style={{backgroundImage:"url(https://images.unsplash.com/photo-1727764894973-28e7283a600c?w=200)", filter: paramsToCss(p.params)}} />
@@ -369,9 +436,8 @@ export default function Kiosk() {
                 ))}
               </div>
               <div className="flex justify-center gap-4">
-                <Button variant="outline" onClick={() => setStep("template")} className="h-16 px-8 text-base">Back</Button>
-                <Button data-testid="kiosk-filter-confirm-button"
-                  onClick={() => template && preset && beginSession(template, preset)}
+                <Button variant="outline" onClick={() => { setStep("template"); }} className="h-16 px-8 text-base">Back</Button>
+                <Button data-testid="kiosk-filter-confirm-button" onClick={startCapture}
                   className="h-16 px-12 text-lg font-bold bg-rose-500 hover:bg-rose-600">
                   <Camera className="w-5 h-5 mr-2" /> Start
                 </Button>
@@ -380,39 +446,48 @@ export default function Kiosk() {
           </motion.div>
         )}
 
+        {/* COUNTDOWN — transparent overlay on top of the persistent live video */}
         {step === "countdown" && (
-          <motion.div key="countdown" initial={{opacity:0}} animate={{opacity:1}}
-            className="w-full h-screen relative">
-            <video ref={videoRef} autoPlay playsInline muted
-              className="w-full h-full object-cover"
-              style={{transform:"scaleX(-1)", filter: cssFilter, visibility: preset?.lut_path ? "hidden" : "visible"}} />
-            {preset?.lut_path && (
-              <canvas ref={lutCanvasRef} data-testid="kiosk-lut-canvas-countdown"
-                className="absolute inset-0 w-full h-full object-cover pointer-events-none" />
-            )}
-            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <motion.div key="countdown" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
+            className="fixed inset-0 z-10 pointer-events-none"
+            data-testid="kiosk-countdown-overlay">
+            {/* Optional soft radial dim so the number stays legible on bright frames — max 30% opacity */}
+            <div className="absolute inset-0"
+                 style={{background: "radial-gradient(ellipse at center, rgba(0,0,0,0.30) 0%, rgba(0,0,0,0) 55%)"}} />
+            <div className="absolute inset-0 flex items-center justify-center">
               <AnimatePresence mode="wait">
-                <motion.div key={count} initial={{scale:0.3, opacity:0}} animate={{scale:1, opacity:1}} exit={{scale:1.5, opacity:0}}
-                  transition={{type:"spring", stiffness:180, damping:14}}
+                <motion.div key={count} initial={{scale:0.3, opacity:0}} animate={{scale:1, opacity:1}}
+                  exit={{scale:1.5, opacity:0}} transition={{type:"spring", stiffness:180, damping:14}}
                   data-testid="kiosk-countdown-display"
-                  className="text-[16rem] font-black leading-none text-white drop-shadow-[0_0_40px_rgba(0,0,0,0.5)]">
+                  className="text-[16rem] font-black leading-none text-white drop-shadow-[0_4px_40px_rgba(0,0,0,0.9)]">
                   {count > 0 ? count : ""}
                 </motion.div>
               </AnimatePresence>
             </div>
             <div className="absolute top-8 left-0 right-0 text-center">
-              <div className="inline-block px-6 py-3 rounded-full bg-black/50 backdrop-blur text-2xl font-bold tracking-widest">
+              <div className="inline-block px-6 py-3 rounded-full bg-black/40 backdrop-blur text-2xl font-bold tracking-widest text-white">
                 {t("get_ready")} — {t("shot_of", {n: shotIndex + 1, t: template?.photo_count || 1})}
               </div>
             </div>
           </motion.div>
         )}
 
+        {/* STILL PREVIEW — 2s image overlay ON TOP of the running video */}
+        {step === "stillPreview" && lastShotPreview && (
+          <motion.div key="still" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
+            data-testid="kiosk-still-preview"
+            className="fixed inset-0 z-10">
+            <img src={lastShotPreview} alt="" className="w-full h-full object-cover" />
+            <div className="absolute top-8 left-0 right-0 text-center">
+              <div className="inline-block px-6 py-3 rounded-full bg-emerald-500/90 text-white text-lg font-bold tracking-widest">
+                SHOT {shotIndex + 1} / {template?.photo_count || 1}
+              </div>
+            </div>
+          </motion.div>
+        )}
+
         {step === "boomerang" && (
-          <motion.div key="boom" initial={{opacity:0}} animate={{opacity:1}}
-            className="w-full h-screen relative">
-            <video ref={videoRef} autoPlay playsInline muted
-              className="w-full h-full object-cover" style={{transform:"scaleX(-1)", filter: cssFilter}} />
+          <motion.div key="boom" initial={{opacity:0}} animate={{opacity:1}} className="fixed inset-0 z-10 pointer-events-none">
             <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40">
               <Film className="w-24 h-24 text-fuchsia-400 mb-6 animate-pulse" />
               <div data-testid="kiosk-boomerang-status" className="text-4xl font-black tracking-tight text-white">
@@ -427,7 +502,7 @@ export default function Kiosk() {
 
         {step === "review" && (
           <motion.div key="review" initial={{opacity:0}} animate={{opacity:1}} exit={{opacity:0}}
-            className="w-full h-screen flex flex-col p-8">
+            className="w-full h-screen flex flex-col p-8 relative z-10 bg-[#0A0D14]">
             <h2 className="text-3xl font-bold mb-6 text-center">Review Your Shots</h2>
             <div className="flex-1 grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6 overflow-auto">
               {photos.map((p, i) => (
@@ -457,7 +532,7 @@ export default function Kiosk() {
 
         {step === "processing" && (
           <motion.div key="proc" initial={{opacity:0}} animate={{opacity:1}}
-            className="w-full h-screen flex flex-col items-center justify-center">
+            className="w-full h-screen flex flex-col items-center justify-center relative z-10 bg-[#0A0D14]">
             <Sparkles className="w-24 h-24 text-rose-500 mb-8 animate-pulse" />
             <div className="text-3xl font-bold mb-4">{t("processing")}</div>
             <Loader2 className="w-8 h-8 animate-spin text-slate-400" />
@@ -466,33 +541,28 @@ export default function Kiosk() {
 
         {step === "delivery" && finalized && (
           <motion.div key="del" initial={{opacity:0}} animate={{opacity:1}}
-            className="w-full h-screen flex flex-col lg:flex-row items-center justify-center gap-12 p-12">
+            className="w-full h-screen flex flex-col lg:flex-row items-center justify-center gap-12 p-12 relative z-10 bg-[#0A0D14]">
             <div className="flex-1 max-w-md">
-              <img src={fileUrl(finalized.print_path)} alt=""
-                className="w-full rounded-2xl shadow-2xl border border-white/10" />
+              <img src={fileUrl(finalized.print_path)} alt="" className="w-full rounded-2xl shadow-2xl border border-white/10" />
             </div>
             <div className="flex-1 max-w-md text-center">
               <img data-testid="kiosk-qr-code-image"
-                src={`${process.env.REACT_APP_BACKEND_URL}/api/qr/${finalized.qr_token}.png`}
-                alt="QR"
+                src={`${process.env.REACT_APP_BACKEND_URL}/api/qr/${finalized.qr_token}.png`} alt="QR"
                 className="w-64 h-64 mx-auto rounded-2xl bg-white p-4" />
               <div className="mt-4 text-lg text-slate-300">{t("scan_qr")}</div>
               <div className="mt-2 text-xs font-mono text-slate-500 break-all">{finalized.guest_url}</div>
-
               <div className="mt-8 flex items-center justify-center gap-3">
                 <label className="text-sm text-slate-400">{t("copies")}:</label>
-                {[1,2,3,4].slice(0, ev.max_copies || 4).map(n => (
+                {[1,2,3,4].slice(0, ev.max_copies || 4).map((n) => (
                   <button key={n} onClick={() => setCopies(n)}
                     className={`w-12 h-12 rounded-full font-bold ${copies===n ? "bg-rose-500" : "bg-white/10"}`}>{n}</button>
                 ))}
               </div>
               <div className="mt-6 flex gap-4 justify-center">
-                <Button data-testid="kiosk-print-again-button" onClick={printNow}
-                  className="h-16 px-8 bg-sky-500 hover:bg-sky-600">
+                <Button data-testid="kiosk-print-again-button" onClick={printNow} className="h-16 px-8 bg-sky-500 hover:bg-sky-600">
                   <Printer className="w-5 h-5 mr-2" /> {t("print_again")}
                 </Button>
-                <Button data-testid="kiosk-done-button" onClick={goIdle}
-                  className="h-16 px-8 bg-emerald-500 hover:bg-emerald-600">
+                <Button data-testid="kiosk-done-button" onClick={goIdle} className="h-16 px-8 bg-emerald-500 hover:bg-emerald-600">
                   <Home className="w-5 h-5 mr-2" /> {t("done")}
                 </Button>
               </div>
@@ -501,14 +571,18 @@ export default function Kiosk() {
         )}
       </AnimatePresence>
 
-      {/* PIN Modal */}
+      {/* Global 150ms flash — sits above everything except the PIN modal */}
+      {flash && <div data-testid="kiosk-flash-overlay"
+        className="animate-flash fixed inset-0 bg-white z-[80] pointer-events-none" />}
+
+      {/* PIN modal */}
       {pinOpen && (
         <div className="fixed inset-0 z-[200] bg-black/80 flex items-center justify-center">
           <div className="bg-slate-900 rounded-3xl p-8 border border-white/10 w-96">
             <h3 className="text-xl font-bold mb-4">{t("admin_pin")}</h3>
             <input data-testid="kiosk-pin-input" type="password" inputMode="numeric" autoFocus
-              value={pin} onChange={e => setPin(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && submitPin()}
+              value={pin} onChange={(e) => setPin(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && submitPin()}
               className="w-full h-14 rounded-xl bg-white/5 border border-white/10 text-white text-2xl text-center tracking-widest" />
             <div className="mt-4 flex gap-3">
               <Button variant="outline" onClick={() => { setPinOpen(false); setPin(""); }} className="flex-1 h-12">{t("cancel")}</Button>

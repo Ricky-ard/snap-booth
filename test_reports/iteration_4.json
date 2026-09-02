@@ -1,0 +1,54 @@
+{
+  "summary": "RE-RUN of the SnapBooth kiosk stale-closure regression test. VERDICT: the iteration_4 fix was NEVER APPLIED — /app/frontend/src/pages/Kiosk.jsx on disk is byte-identical to the iteration_3 build (553 lines, mtime unchanged). grep finds ZERO occurrences of 'sessionRef', 'countdownIv', 'console.error' or 'No photos uploaded'; ctx.filter is still assigned AFTER ctx.drawImage (line ~176); catch blocks are still bare `catch {}`; step==='template-auto' still fires setTimeout inside the render body; finalize() still has no raw_photos precondition. Runtime verification reproduced the iteration_3 regression EXACTLY: full 1-photo session (template idx 1 = 4x6 Portrait, preset idx 0) produced network trace POST /api/sessions/start -> 200, then finalize -> 200, with ZERO POST /api/sessions/photo requests; 'Upload failed' toast appeared; the composed print PNG rendered as template chrome only (empty slot); GET /api/g/zC0SzfqEqEI returns session.raw_photos == []. gUM stub confirmed working (window.__gumCalls === 1). Backend regression suite: 74/74 PASSED. Multi-shot / boomerang / finalize-guard / interval-cleanup sub-tests were NOT executed because the decisive precondition (fix present in code) is false — they would all fail for the same single root cause and burn cycles.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/sessions/{id}/finalize", "issue": "Returns 200 and produces a print PNG with completely empty photo slots when the session has raw_photos == []. Backend could 4xx on an empty session as defence-in-depth (frontend guard is the primary fix)."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Capture -> photo upload (/api/sessions/photo) — FIRST PASS",
+        "issue": "UNFIXED / NOT DELIVERED. Decisive assertion FAILS: 0 POST /api/sessions/photo requests fire for the first-pass shot. Reproduced verbatim: /kiosk -> Tap to Start -> template card #1 (4x6 Portrait) -> preset #0 -> Start; network log = [POST /api/sessions/start 200, POST /api/sessions/{id}/finalize 200] only. Toast 'Upload failed' shown. GET /api/g/zC0SzfqEqEI -> session.raw_photos = []. Root cause unchanged from iteration_3: startCapture() does setSession(r.data) then synchronously calls runCountdown(0); captureShot(n) reads `session` (still null) from the stale render closure, so `session.id` throws a TypeError inside the try block.",
+        "affected_selectors": ["[data-testid=kiosk-filter-confirm-button]", "[data-testid=kiosk-still-preview]", "[data-sonner-toast]"]
+      },
+      {
+        "flow": "Finalize with no photos — guard",
+        "issue": "NOT IMPLEMENTED. The kiosk still transitions to the delivery step and renders kiosk-qr-code-image; the expected toast 'No photos uploaded — check camera & try again' does not exist anywhere in the codebase. Guest receives a QR to an empty gallery.",
+        "affected_selectors": ["[data-testid=kiosk-confirm-print-button]", "[data-testid=kiosk-qr-code-image]"]
+      },
+      {
+        "flow": "Boomerang (template idx 3) / multi-shot (template idx 2)",
+        "issue": "NOT RE-TESTED but guaranteed still broken — captureBoomerang() and the n+1 recursion path both read the same stale `session` variable (Kiosk.jsx lines ~186 and ~227). Will fail identically to iteration_3 once the primary fix lands, so retest is required."
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": ["/app/backend/tests/", "/app/test_reports/pytest/pytest_results.xml", "/app/test_reports/iteration_3.json"],
+  "action_items": [
+    "CRITICAL — THE FIX WAS NOT SAVED. Re-apply all 6 changes to /app/frontend/src/pages/Kiosk.jsx and verify with `grep -n sessionRef /app/frontend/src/pages/Kiosk.jsx` before handing off again.",
+    "1) Add `const sessionRef = useRef(null)`; in startCapture() set `sessionRef.current = r.data` BEFORE `runCountdown(0)`; change captureShot/captureBoomerang/finalize/printNow to use `sessionRef.current.id`; clear it in goIdle().",
+    "2) Replace bare `catch {}` in captureShot (line ~187), captureBoomerang (~227), finalize (~236) and printNow (~245) with `catch (e) { console.error(...); toast.error(...) }`.",
+    "3) Store runCountdown's setInterval handle in a `countdownIv` ref and clearInterval it in goIdle() and on unmount.",
+    "4) Move `if (preset && !preset.lut_path) ctx.filter = paramsToCss(preset.params)` to BEFORE `ctx.drawImage(...)` in captureShot.",
+    "5) Guard finalize(): if the local `photos` array (or the server session raw_photos) is empty, `toast.error('No photos uploaded — check camera & try again')` and stay on review instead of calling /finalize.",
+    "6) Move the `step === 'template-auto'` setTimeout(beginSessionFromTemplate) side effect out of the render body into a useEffect."
+  ],
+  "critical_code_review_comments": [
+    "Kiosk.jsx:136-143 — startCapture() still calls runCountdown(0) from the same closure in which `session` is null. Single root cause of every upload failure.",
+    "Kiosk.jsx:176 — ctx.filter is still set AFTER ctx.drawImage, so the CSS-preset parity filter is a no-op on the captured JPEG.",
+    "Kiosk.jsx:145-163 — countdown setInterval handle is still discarded; goIdle() during a countdown leaves it running and captureShot will fire on a reset session.",
+    "Kiosk.jsx:372 — `step === 'template-auto' && (() => { setTimeout(...) })()` performs a side effect during render; under React 18 StrictMode this double-fires.",
+    "Kiosk.jsx:187/227/236/245 — bare `catch {}` masks TypeErrors as user-facing 'Upload failed' toasts; this is exactly why the defect produced no console error and no 4xx/5xx in the network log."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (74/74 pytest)", "frontend": "0% — primary regression assertion FAILS; fix not present in source"},
+  "seed_data_creation": "2 kiosk sessions created via the public flow during verification (gallery tokens zC0SzfqEqEI and one earlier un-finalized session id 6a13b1b0-1e35-4dc9-9fbe-a7ee66955e2d). Both have raw_photos == [] and blank prints; safe to delete.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "/app/memory/test_credentials.md — admin password 'snapbooth', kiosk exit PIN 1234 (PIN not needed; cleanup test was not reached)",
+  "context_for_next_testing_agent": "The gUM stub + selectors that work on this build (use verbatim): add_init_script overriding navigator.mediaDevices.getUserMedia to return a 1280x720 canvas.captureStream(25) driven by a 40ms setInterval, plus context.grant_permissions(['camera']). IMPORTANT: page.goto MUST use wait_until='domcontentloaded' — 'networkidle' never fires on /kiosk (30s timeout). Correct testids (NOT the ones assumed in the review request): kiosk-attract-start-button, kiosk-template-option-card (5 cards, index 1 = 4x6 Portrait 1-photo, 2 = Classic 2x6 Strip 3-photo, 3 = Square Social boomerang), kiosk-filter-option-button (12 presets), kiosk-filter-confirm-button (starts capture), kiosk-countdown-overlay, kiosk-still-preview, kiosk-retake-button, kiosk-confirm-print-button, kiosk-qr-code-image, kiosk-flash-overlay, kiosk-live-feed-layer, kiosk-camera-live-feed. Timing: countdown starts at 5 and ticks 1s, so allow ~9.5s from kiosk-filter-confirm-button click to the review screen for a 1-photo template. Toasts auto-dismiss in ~4s — poll [data-sonner-toast] every 250ms rather than reading once. Live-feed persistence (the iteration_3 6/6 criteria) was NOT re-instrumented this round because Kiosk.jsx is unchanged; window.__gumCalls === 1 was re-confirmed. Re-run the full MutationObserver instrumentation only after the sessionRef fix lands, since that edit touches the same file.",
+  "rca_of_the_issue": "No code change reached disk between iteration_3 and iteration_4. `git diff --stat HEAD -- frontend/src/pages/Kiosk.jsx` shows only the iteration_3 live-feed rewrite (+171/-140); grep for sessionRef/countdownIv/'No photos uploaded'/console.error returns nothing (exit 1). The runtime trace therefore reproduces the iteration_3 stale-closure defect one-for-one: startCapture() -> setSession() -> runCountdown(0) -> captureShot(0) evaluates `session.id` where `session` is the pre-update (null) closure value, throwing a TypeError that the bare catch converts into an 'Upload failed' toast, so POST /api/sessions/photo is never issued and the session finalizes with raw_photos == []."
+}

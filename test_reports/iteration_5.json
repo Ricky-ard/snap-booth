@@ -1,0 +1,68 @@
+{
+  "summary": "RUNTIME verification of the SnapBooth stale-closure fix. VERDICT: THE FIX IS ON DISK AND WORKS AT RUNTIME. All four P0 flows PASS end-to-end plus both requested regressions. (1) Single-photo (4x6 Portrait): POST /api/sessions/photo fired ONCE -> 200, review rendered 1 thumbnail, kiosk-confirm-print-button -> delivery with kiosk-qr-code-image. (2) Multi-shot (Classic 2x6 Strip, 3 photos): POST /api/sessions/photo fired 3x with slot_index [0,1,2] all 200; MutationObserver recorded 0 detach events for kiosk-camera-live-feed and video mount count == 1 across the whole session; in ALL 57 stillPreview samples and ALL 138 countdown samples the persistent <video> was mounted with srcObject != null, videoWidth==1280, readyState==4, visibility=visible; review rendered 3 thumbnails. (3) Boomerang (Square Social 1:1): /sessions/photo 200 then /sessions/boomerang with exactly 12 frames -> 200, kiosk-boomerang-status 'HOLD IT - BOOMERANG!' shown, kiosk-boomerang-preview rendered in review. (4) FINALIZE GUARD: with route interception forcing POST /api/sessions/photo -> 500, clicking kiosk-confirm-print-button produced the toast 'No photos uploaded - check camera & try again', ZERO POST /finalize requests were issued, the kiosk STAYED on review and kiosk-qr-code-image was never rendered. REGRESSIONS: window.__gumCalls === 1 after the full 3-shot strip flow AND after a retake (camera acquired exactly once per session). Countdown interval abort: aborting mid-countdown via reload and via SPA nav left 0 orphan ticks, 0 stray /sessions/photo requests, and 0 countdown overlays after 2s of waiting. Bare catches are gone (console.error 'photo upload failed' and 'finalize aborted: no uploaded photos' were both observed in the console log). Backend regression suite 74/74 PASSED; backend sanity for /events/active, /sessions/start, /sessions/photo and /finalize guest_url (lan_ip vs Origin) all PASS. TWO NEW DEFECTS FOUND: a retake cascade bug and an intermittent countdown tick skip. Screenshot evidence of the live camera visible mid-countdown behind the giant number was captured (.screenshots/EVIDENCE_live_feed_mid_countdown.png, count=3, srcObject=true, visibility=visible, videoWidth=1280).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/sessions/{id}/finalize", "issue": "Still returns 200 and composes a print PNG with empty photo slots when the session has raw_photos == []. The frontend guard now blocks this path, but backend defence-in-depth (400 on an empty session) is still missing. Carried over unfixed from iteration_4."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "Kiosk countdown (AnimatePresence mode=\"wait\" + spring exit)",
+        "issue": "INTERMITTENT SKIPPED COUNTDOWN TICK. A rAF-resolution in-page sampler recorded the rendered sequence of kiosk-countdown-display as ['5','4','2','1'] on one run (tick '3' NEVER rendered) and full 5..1 on another. Timeline from the failing run: '5'@t=670ms, '4'@t=2170ms, '2'@t=3341ms, '1'@t=5117ms. RCA: AnimatePresence mode=\"wait\" must finish the exit animation of key={count} before mounting the next key, but the exit transition is a spring (stiffness 180, damping 14) that scales to 1.5 and fades out, taking >1000ms - longer than the 1s setInterval tick. Framer-motion therefore drops the intermediate key. Secondary symptom visible in the evidence screenshot: because the enter spring also runs ~700ms of a 1000ms slot, the giant number sits at low opacity/half-scale for most of its life and is barely legible over a bright camera frame. FIX: drop mode=\"wait\" (use the default sync mode) or give the exit an explicit short tween, e.g. exit={{scale:1.4, opacity:0}} transition={{duration:0.18}}, so the exit always completes inside one tick.",
+        "selector": "[data-testid=\"kiosk-countdown-display\"]",
+        "priority": "HIGH"
+      }
+    ],
+    "integration_issues": [
+      {
+        "flow": "Retake a middle slot on a multi-shot template",
+        "issue": "RETAKE CASCADES INTO SUBSEQUENT SLOTS. On the 3-photo Classic 2x6 Strip, after a clean 3-shot session I clicked kiosk-retake-button index 1 ('Retake #2'). Observed network: POST /api/sessions/photo slot_index=1 followed by POST /api/sessions/photo slot_index=2 - the kiosk re-shot slot 2 as well instead of returning to review after the single retaken frame. RCA: retake(n) calls runCountdown(n), and the tail of captureShot(n) unconditionally runs `if (n + 1 < total) { setShotIndex(n+1); setStep('countdown'); runCountdown(n+1) }`. captureShot has no notion of 'this was a retake', so retaking slot 0 of a 3-shot strip re-shoots the entire session and retaking the last slot of a boomerang template re-triggers captureBoomerang() (a second 12-frame upload). FIX: pass a retake flag (e.g. captureShot(n, {single: true})) or hold a retakeRef, and when set go straight back to setStep('review') instead of advancing to n+1.",
+        "affected_selectors": ["[data-testid=\"kiosk-retake-button\"]", "[data-testid=\"kiosk-confirm-print-button\"]"]
+      }
+    ],
+    "design_issues": [
+      {
+        "screen": "Kiosk delivery",
+        "issues": [
+          "The composed print preview <img className=\"w-full rounded-2xl\"> has no max-height, so for tall templates (2x6 strip, 1200x1800) it overflows the 1080px viewport and the top photo of the strip is cut off. Add max-h-[80vh] w-auto object-contain."
+        ]
+      },
+      {
+        "screen": "Kiosk review (toast stack)",
+        "issues": [
+          "When two sonner toasts stack (e.g. 'Upload failed' + 'No photos uploaded - check camera & try again'), the newly-mounted top toast renders dark-red text on a dark/dimmed surface for its entry frames and is close to unreadable. Cosmetic/transient, low priority."
+        ]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_boomerang.py",
+    "/app/backend/tests/test_lut_parity.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "HIGH - Fix the retake cascade: captureShot() must not auto-advance to slot n+1 (nor call captureBoomerang()) when it was invoked from retake(n). Verified failing: Retake #2 on the 3-photo strip issued /sessions/photo for slot 1 AND slot 2.",
+    "HIGH - Fix the skipped countdown tick: remove mode=\"wait\" from the countdown AnimatePresence or replace the spring exit with a <=200ms tween so each of 5,4,3,2,1 renders for its full second. Reproduced: rendered sequence ['5','4','2','1'].",
+    "LOW - Add max-h-[80vh] object-contain to the delivery print preview image so tall 2x6 strips are not cropped by the viewport.",
+    "LOW - Backend hardening: POST /api/sessions/{id}/finalize should return 400 when the session has no non-null photo_paths instead of composing an empty print (frontend guard is now the only protection)."
+  ],
+  "critical_code_review_comments": [
+    "Kiosk.jsx:211-223 - captureShot's tail is the single source of the retake cascade; it has no retake context. This is the last remaining correctness bug in the capture state machine.",
+    "Kiosk.jsx:458-465 - AnimatePresence mode=\"wait\" with a spring exit inside a 1s interval is inherently lossy; the animation duration must be strictly shorter than the tick interval.",
+    "Kiosk.jsx:93-100 - resetIdle's useCallback closes over goIdle, which is a plain function redeclared every render and NOT in the dep array; it works today only because goIdle reads refs/setters, but it is a latent stale-closure of exactly the class that caused the original defect. Wrap goIdle in useCallback and list it as a dependency.",
+    "Kiosk.jsx:55-60 - the /events/active loader still swallows errors with a bare `.catch(() => {})`, so a backend outage leaves the kiosk stuck on the 'Loading...' spinner with no diagnostic. This is the only bare catch left in the file.",
+    "Kiosk.jsx:196 (596 lines total) - the file is approaching the 700-line threshold; the countdown/stillPreview/review/delivery steps should be extracted into separate step components before more features land.",
+    "store/kiosk.js:33 - `try { ... } catch {}` in release() is a bare catch; low risk but inconsistent with the rest of the cleanup."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100% (74/74 pytest + 4/4 manual sanity assertions)", "frontend": "85% - all 4 P0 flows and both regressions PASS; 2 defects found in adjacent behaviour (retake cascade, countdown tick skip)"},
+  "seed_data_creation": "6 kiosk sessions created through the public flow (1 single-photo, 2 three-shot strips, 1 boomerang, 1 forced-failure session with raw_photos == [], plus 2 API-only sessions from the backend sanity script). Gallery tokens include 0hvQhn3gDiM, HMhAhacu2uU, p4mlEff9pkA, uZykEw5Rh-g. All are disposable test data.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "/app/memory/test_credentials.md - admin password 'snapbooth', kiosk exit PIN 1234. Kiosk flow is public; neither credential was needed this round.",
+  "context_for_next_testing_agent": "THE STALE-CLOSURE FIX IS CONFIRMED WORKING AT RUNTIME - do not re-litigate it, only smoke it. Working harness (reuse verbatim): context.grant_permissions(['camera']) + add_init_script that sets window.__gumCalls=0 and overrides navigator.mediaDevices.getUserMedia to return a 1280x720 canvas.captureStream(25) driven by a 40ms setInterval that paints an hsl() background plus a 'LIVE <frame>' label (the moving label is what proves live frames are reaching the <video>). page.goto MUST use wait_until='domcontentloaded'. Template cards by name: idx0 '4x6 Quad Grid' (4 photos), idx1 '4x6 Portrait' (1 photo - fast path ~9.5s), idx2 'Classic 2x6 Strip' (3 photos ~28s), idx3 'Square Social 1:1' (1 photo + boomerang), idx4 '2x6 Duo' (3 photos). Select by text_content match, NOT by index. Read slot_index off the request with r.post_data_json inside a page.on('request') handler. For live-feed persistence use a MutationObserver installed on DOMContentLoaded that counts removedNodes/addedNodes matching [data-testid=\"kiosk-camera-live-feed\"] - detach must stay 0 and mount count 1. To sample the countdown reliably you MUST use an in-page requestAnimationFrame sampler (a 100-120ms Playwright poll loop is too coarse and will falsely report a missing tick); note the countdown header text is 'GET READY - Shot n of N' so slice/startswith filters need the full string. Finalize-guard reproduction: page.route('**/api/sessions/photo', fulfill status=500) then run the 1-photo template and click kiosk-confirm-print-button; poll [data-sonner-toast] every 250ms. window.__gumCalls resets to 0 after any page.reload because add_init_script re-runs - measure it before reloading. NEXT ROUND: re-verify the retake path (click kiosk-retake-button nth(1) on the 3-photo strip and assert EXACTLY ONE /sessions/photo with slot_index==1) and re-run the rAF countdown sampler 3x to confirm 5,4,3,2,1 all render.",
+  "rca_of_the_issue": "Original stale-closure defect: RESOLVED. startCapture now assigns sessionRef.current = r.data before runCountdown(0), and captureShot/captureBoomerang/finalize/printNow read sessionRef.current, so the setInterval/setTimeout closures no longer observe session === null; POST /api/sessions/photo was confirmed firing 200 for every slot in every template tested, and the finalize precheck (GET /api/sessions/{id} -> photo_paths) correctly blocks an empty print. Two independent defects remain. (1) Retake cascade: retake(n) reuses runCountdown(n), whose completion handler in captureShot unconditionally evaluates `n + 1 < template.photo_count` and recurses, so a retake is indistinguishable from a normal shot and re-shoots every later slot; reproduced deterministically as /sessions/photo slot_index=1 then slot_index=2 after a single 'Retake #2' click. (2) Skipped countdown tick: the countdown AnimatePresence uses mode=\"wait\", which defers mounting key={count} until the previous key's exit animation resolves; that exit is a spring (stiffness 180, damping 14, scale->1.5) whose settle time exceeds the 1000ms setInterval period, so framer-motion silently drops an intermediate key and the user sees 5,4,2,1. Both are pure frontend state-machine/animation issues; the camera contract itself (one gUM call, one persistently mounted <video>, live frames during every tick and every 2s still-preview) was verified intact with 0 detach events and readyState 4 throughout."
+}
