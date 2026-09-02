@@ -1,32 +1,97 @@
-"""Booth Bridge — local companion agent.
+"""Booth Bridge — local companion agent for SnapBooth.
 
-Runs on the event laptop (NOT in the cloud). Talks to the DSLR (gphoto2 /
-digiCamControl) and the printer (CUPS on macOS/Linux, spooler on Windows) and
-exposes a small HTTP API on 127.0.0.1:8787 that the web app calls.
+This agent runs on the event laptop (macOS / Linux / Windows) and exposes a
+small HTTP + WebSocket API on 127.0.0.1:8787 so the browser-based kiosk can
+drive a real DSLR / mirrorless camera and a real photo printer that the
+browser cannot reach.
 
-This file is a fully working mock/scaffold — endpoints return realistic
-payloads so the SnapBooth UI can be developed against it. Real drivers are
-stubbed with clearly marked TODO sections.
+Camera drivers (auto-detected in this order):
+    1. gphoto2         — macOS / Linux, Canon / Sony / Nikon / Fuji via libgphoto2
+    2. digiCamControl  — Windows, HTTP API on :5513
+    3. webcam          — cross-platform OpenCV fallback (always works)
+
+Printer drivers:
+    1. cups            — macOS / Linux via `lp`  (pycups optional)
+    2. windows         — Windows print spooler via win32print / ShellExecute
+    3. mock            — logs jobs to memory; used when no printer is picked
+
+Endpoints (spec section 6):
+
+    GET  /health
+    GET  /camera/status        -> { connected, model, battery, mode, driver }
+    GET  /camera/liveview      -> MJPEG stream (multipart/x-mixed-replace)
+    POST /camera/capture       -> { file_path, jpeg_base64 }
+    GET  /camera/settings      -> { iso, aperture, shutter, wb }
+    POST /camera/settings
+
+    GET  /printer/list         -> system printers
+    GET  /printer/status       -> { name, state, jobs_pending, media_remaining }
+    POST /printer/print        -> { file_path, copies, paper_size } -> job id
+    GET  /printer/queue
+    POST /printer/queue/{id}/cancel
+    POST /printer/select       -> { name }
 """
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import platform
+import sys
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List
-import asyncio, io, os, sys, time, platform
+from typing import Optional
 
-app = FastAPI(title="Booth Bridge")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+from drivers import select_camera_driver, select_printer_driver
+from drivers.base import CameraDriver, PrinterDriver
 
-STATE = {
-    "camera": {"connected": True, "model": "Mock DSLR (Canon-like)", "battery": 85, "mode": "Manual"},
-    "printer": {"name": "Mock DNP DS-RX1HS", "state": "ready", "jobs_pending": 0, "media_remaining": 400},
-    "jobs": [],  # {id, state, copies, path, created}
-    "settings": {"iso": 400, "aperture": "f/4.0", "shutter": "1/125", "wb": "auto"},
-}
+log = logging.getLogger("booth-bridge")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+
+STATE: dict = {"camera": None, "printer": None}  # populated on startup
 
 
-class CameraSettings(BaseModel):
+# ---------------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    forced_cam = os.environ.get("BRIDGE_CAMERA")  # gphoto2 | digicam | webcam
+    forced_pr = os.environ.get("BRIDGE_PRINTER")  # cups | windows | mock
+    STATE["camera"] = select_camera_driver(preferred=forced_cam)
+    STATE["printer"] = select_printer_driver(preferred=forced_pr)
+    log.info("Camera  driver: %s", STATE["camera"].name)
+    log.info("Printer driver: %s", STATE["printer"].name)
+    try:
+        yield
+    finally:
+        try: STATE["camera"].close()
+        except Exception: pass
+        try: STATE["printer"].close()
+        except Exception: pass
+
+
+app = FastAPI(title="Booth Bridge", version="1.0.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+
+def cam() -> CameraDriver: return STATE["camera"]
+def pr() -> PrinterDriver: return STATE["printer"]
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+class CameraSettingsIn(BaseModel):
     iso: Optional[int] = None
     aperture: Optional[str] = None
     shutter: Optional[str] = None
@@ -39,101 +104,122 @@ class PrintJobIn(BaseModel):
     paper_size: Optional[str] = "4x6"
 
 
-# -------- Camera --------
+class PrinterSelectIn(BaseModel):
+    name: str
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "platform": platform.system(),
+        "python": sys.version.split()[0],
+        "camera_driver": cam().name,
+        "printer_driver": pr().name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
 @app.get("/camera/status")
 async def camera_status():
-    # TODO: replace with gphoto2 (macOS/Linux) or digiCamControl HTTP (Windows)
-    return STATE["camera"]
+    return {**cam().status(), "driver": cam().name}
 
-@app.get("/camera/settings")
-async def camera_settings_get():
-    return STATE["settings"]
 
-@app.post("/camera/settings")
-async def camera_settings_set(payload: CameraSettings):
-    for k, v in payload.model_dump(exclude_none=True).items():
-        STATE["settings"][k] = v
-    return STATE["settings"]
+@app.get("/camera/liveview")
+async def camera_liveview():
+    boundary = b"--boothbridge"
+    async def gen():
+        try:
+            async for jpeg in cam().liveview():
+                yield boundary + b"\r\nContent-Type: image/jpeg\r\nContent-Length: " \
+                      + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n"
+        except asyncio.CancelledError:
+            return
+    return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=boothbridge")
+
 
 @app.post("/camera/capture")
 async def camera_capture():
-    # TODO: gphoto2.trigger_capture() or digiCamControl /?slc=capture
-    # For now, return a placeholder 1x1 JPEG so callers can integrate flow.
-    import base64
-    stub = base64.b64encode(bytes.fromhex(
-        "ffd8ffe000104a46494600010100000100010000ffdb004300080606070605080707"
-        "070909080a0c140d0c0b0b0c1912130f141d1a1f1e1d1a1c1c20242e2720222c231c1c"
-        "2837292c30313434341f27393d38323c2e333432ffdb0043010909090c0b0c180d0d1832"
-        "1c1c211c32323232323232323232323232323232323232323232323232323232323232"
-        "3232323232323232323232323232323232323232323232ffc0001108000100010301220"
-        "0021101031101ffc4001f0000010501010101010100000000000000000102030405060"
-        "708090a0bffc400b5100002010303020403050504040000017d01020300041105122131"
-        "410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a252"
-        "6272829"))
-    return {"file_path": "/dev/null", "jpeg_base64": stub.decode()}
+    try:
+        return await cam().capture()
+    except Exception as e:
+        log.exception("capture failed")
+        raise HTTPException(500, f"capture failed: {e}")
 
 
-# -------- Live view (MJPEG stub) --------
-async def _mjpeg():
-    """Yields a periodic tiny JPEG so the UI can wire up a stream if needed."""
-    while True:
-        import base64
-        b = base64.b64decode("/9j/4AAQSkZJRgABAQEAAAAAAAD//gA7Q1JFQVRPUjogZ2QtanBlZ/8AwABQAKAAAAA/9k=".encode())
-        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + b + b"\r\n")
-        await asyncio.sleep(0.1)
-
-@app.get("/camera/liveview")
-async def liveview():
-    return StreamingResponse(_mjpeg(), media_type="multipart/x-mixed-replace;boundary=frame")
+@app.get("/camera/settings")
+async def camera_settings_get():
+    return cam().get_settings()
 
 
-# -------- Printer --------
+@app.post("/camera/settings")
+async def camera_settings_set(payload: CameraSettingsIn):
+    return cam().set_settings(**payload.model_dump(exclude_none=True))
+
+
+# ---------------------------------------------------------------------------
+# Printer
+# ---------------------------------------------------------------------------
 @app.get("/printer/list")
 async def printer_list():
-    system = platform.system()
-    # TODO: use pycups on macOS/Linux, win32print on Windows
-    return {"system": system, "printers": [STATE["printer"]["name"], "PDF (Preview)"]}
+    return {"system": platform.system(), "printers": pr().list()}
+
 
 @app.get("/printer/status")
 async def printer_status():
-    return STATE["printer"]
+    return pr().status()
+
+
+@app.post("/printer/select")
+async def printer_select(payload: PrinterSelectIn):
+    pr().select(payload.name)
+    return pr().status()
+
 
 @app.post("/printer/print")
 async def printer_print(payload: PrintJobIn):
-    if not os.path.exists(payload.file_path):
+    if not Path(payload.file_path).exists():
         raise HTTPException(400, f"file not found: {payload.file_path}")
-    jid = f"job-{int(time.time() * 1000)}"
-    job = {"id": jid, "state": "queued", "copies": payload.copies,
-           "file_path": payload.file_path, "created": time.time()}
-    STATE["jobs"].append(job)
-    STATE["printer"]["jobs_pending"] = sum(1 for j in STATE["jobs"] if j["state"] in ("queued", "printing"))
-    asyncio.create_task(_process_job(jid))
-    return {"job_id": jid, "state": "queued"}
+    job = await pr().enqueue(payload.file_path, payload.copies, payload.paper_size)
+    return job
 
-async def _process_job(jid: str):
-    # Simulate printing latency; on a real machine use pycups.printFile / ShellExecute "print"
-    job = next((j for j in STATE["jobs"] if j["id"] == jid), None)
-    if not job:
-        return
-    job["state"] = "printing"
-    await asyncio.sleep(3)
-    job["state"] = "done"
-    STATE["printer"]["media_remaining"] = max(0, STATE["printer"]["media_remaining"] - job["copies"])
-    STATE["printer"]["jobs_pending"] = sum(1 for j in STATE["jobs"] if j["state"] in ("queued", "printing"))
 
 @app.get("/printer/queue")
 async def printer_queue():
-    return STATE["jobs"][-50:]
+    return pr().queue()
+
 
 @app.post("/printer/queue/{jid}/cancel")
 async def printer_cancel(jid: str):
-    for j in STATE["jobs"]:
-        if j["id"] == jid and j["state"] in ("queued", "printing"):
-            j["state"] = "cancelled"
-            return {"ok": True}
-    raise HTTPException(404, "job not found")
+    ok = pr().cancel(jid)
+    if not ok:
+        raise HTTPException(404, "job not found or not cancellable")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(description="SnapBooth Booth Bridge")
+    ap.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=8787, help="bind port (default 8787)")
+    ap.add_argument("--camera", choices=["gphoto2", "digicam", "webcam"],
+                    help="force a camera driver")
+    ap.add_argument("--printer", choices=["cups", "windows", "mock"],
+                    help="force a printer driver")
+    args = ap.parse_args()
+    if args.camera: os.environ["BRIDGE_CAMERA"] = args.camera
+    if args.printer: os.environ["BRIDGE_PRINTER"] = args.printer
+
+    import uvicorn
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8787)
+    main()
